@@ -47,3 +47,29 @@ Check U6 3.3 V supply/decoupling, U6 pin 1 OE (BUS_TX must remain high while
 receiving), U6 solder joints, and continuity from U6 pin 4 to GPIO42. Replacing
 or reflowing U6 is the highest-value repair. The temporary PCNT instrumentation
 was removed from the production firmware after collecting this evidence.
+
+## Retest after U6-path hardware repair
+
+The user repaired the board before installing it on the motor. Both bridges
+were kept stopped/asleep during the following 1 Mbaud tests.
+
+```text
+Ping request/response:   COM18 -> COM19 1000/1000
+                         COM19 -> COM18 1000/1000
+Long STATUS response:    COM18 -> COM19 100/100
+                         COM19 -> COM18 100/100
+One-way at 100 Hz:       COM18 tx=1000, COM19 valid=1000, CRC=0
+One-way at 200 Hz:       COM18 tx=1000, COM19 valid=910, CRC=2
+200 Hz sync exchange:    leader tx=1001, response rx=71, then link stopped
+```
+
+The repair restored ordinary bidirectional communication, but the board is not
+yet accepted for the intended 200 Hz position/force-feedback exchange.
+
+The current schematic uses a 10 kOhm DATA pull-up (R9) on each board, or 5 kOhm
+effective with two boards. An earlier revision of the same bus circuit used a
+1 kOhm pull-up. Before motor installation, use one centralized 1-2.2 kOhm DATA
+pull-up (or 2.2 kOhm on each of two boards for about 1.1 kOhm effective), then
+repeat the 200 Hz one-way and synchronization tests. This keeps low-level sink
+current within the SN74LVC1G126 capability while materially improving DATA rise
+time at 1 Mbaud.

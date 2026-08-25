@@ -41,6 +41,7 @@ def main() -> int:
     parser.add_argument("--count", type=int, default=100)
     parser.add_argument("--first", choices=("A", "B"), default="A")
     parser.add_argument("--gap-ms", type=float, default=0.0)
+    parser.add_argument("--command", choices=("ping", "status"), default="ping")
     args = parser.parse_args()
 
     ports = {
@@ -77,9 +78,10 @@ def main() -> int:
             for _ in range(args.count):
                 port.reset_input_buffer()
                 started = time.perf_counter()
-                send(port, f"bus {addresses[peer]} ping")
-                lines = read_until(port, lambda line: "payload=PONG" in line, 0.2)
-                if any("payload=PONG" in line for line in lines):
+                expected_payload = "payload=PONG" if args.command == "ping" else "payload=STATUS,"
+                send(port, f"bus {addresses[peer]} {args.command}")
+                lines = read_until(port, lambda line: expected_payload in line, 0.2)
+                if any(expected_payload in line for line in lines):
                     ok += 1
                     latencies_ms.append((time.perf_counter() - started) * 1000)
                 else:
@@ -101,7 +103,7 @@ def main() -> int:
         worst = max(latencies_ms, default=0)
         print(
             f"RESULT={'PASS' if total_timeout == 0 else 'FAIL'} "
-            f"ok={total_ok}/{args.count * 2} avg={average:.3f}ms "
+            f"command={args.command} ok={total_ok}/{args.count * 2} avg={average:.3f}ms "
             f"worst={worst:.3f}ms timeouts={total_timeout}"
         )
         return 0 if total_timeout == 0 else 3
