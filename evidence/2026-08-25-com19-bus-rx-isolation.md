@@ -73,3 +73,36 @@ pull-up (or 2.2 kOhm on each of two boards for about 1.1 kOhm effective), then
 repeat the 200 Hz one-way and synchronization tests. This keeps low-level sink
 current within the SN74LVC1G126 capability while materially improving DATA rise
 time at 1 Mbaud.
+
+## Accepted retest after COM19 R9 changed to 1 kOhm
+
+COM18 retained its 10 kOhm R9 and COM19 R9 was changed to 1 kOhm. The two
+parallel pull-ups therefore measure approximately 909 Ohm effective. Device
+identity was re-locked by eFuse MAC before testing. Both motor connectors were
+uninstalled and both bridges were returned to sleep after every test.
+
+```text
+COM18 -> COM19 one-way: 1000/1000 at 200.00 Hz over 5.000 s
+COM19 -> COM18 one-way: 1000/1000 at 200.00 Hz over 5.000 s
+Both directions:        crc_err=0, resync=0, uart_err=0
+
+200 Hz sync, 5 seconds: requests=984, responses=984
+Effective sync rate:    196.80 Hz
+Latest response age:    757 us
+Sync bus errors:        crc_err=0, resync=0, uart_err=0
+
+Ping request/response:  COM18 -> COM19 1000/1000
+                        COM19 -> COM18 1000/1000
+                        average 3.486 ms, worst 4.083 ms, timeouts 0
+STATUS response:        COM18 -> COM19 100/100
+                        COM19 -> COM18 100/100
+                        average 5.971 ms, worst 6.572 ms, timeouts 0
+```
+
+The R9 change removes the previous direction-specific 200 Hz loss and the DATA
+link is accepted for motor installation and loaded position/force-feedback
+testing. The single sync `timeout=1` observed in the no-motor test was an
+intentional fail-safe event because COM19 was held asleep; frame exchange
+continued for the full five seconds.
+
+Final safe state on both boards: `awake=0`, `pwm=0/4095`, `nFAULT=1`.
