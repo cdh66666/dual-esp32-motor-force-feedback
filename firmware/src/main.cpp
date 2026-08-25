@@ -1,9 +1,10 @@
 #include <Arduino.h>
+#include <HardwareSerial.h>
 #include <Wire.h>
 #include <Preferences.h>
 
 static constexpr const char *FW_NAME = "dual-esp32-motor-control";
-static constexpr const char *FW_VERSION = "0.1.0-unified";
+static constexpr const char *FW_VERSION = "0.3.20-proven-bus-production";
 
 // ESP32-S3-WROOM-1-N16 mapping taken from the supplied schematic.
 static constexpr int PIN_ENBL = 4;       // SS6952T ENBL/IN1, PWM
@@ -63,6 +64,19 @@ static constexpr uint8_t BUS_TYPE_PONG = 5;
 static constexpr uint8_t BUS_TYPE_SYNC = 6;
 static constexpr uint32_t BUS_BAUDRATE = 1000000;
 static uint32_t busBaudrate = BUS_BAUDRATE;
+// Match the proven Bus_Servo_Driver transport: UART1 stays enabled at all
+// times. The board's Q1/U8 auto-direction circuit releases DATA after each
+// stop bit; firmware never toggles BUS_TX or restarts the UART.
+static HardwareSerial BusSerial(1);
+static uint32_t busCrcErrorCount = 0;
+static uint32_t busResyncCount = 0;
+static uint32_t busRxByteCount = 0;
+static uint32_t busUartErrorCount = 0;
+static uint32_t busValidFrameCount = 0;
+static uint32_t busAddressedFrameCount = 0;
+static uint32_t busCommandRxCount = 0;
+static uint32_t busFrameTxCount = 0;
+static uint32_t busResponseTxCount = 0;
 static constexpr uint32_t SYNC_PERIOD_US = 5000;       // 200 Hz request/response exchange
 static constexpr uint32_t SYNC_LINK_TIMEOUT_US = 30000;
 static constexpr uint8_t SYNC_PAYLOAD_VERSION = 1;
@@ -208,18 +222,18 @@ static int8_t currentSensePolarity = 1;
 static constexpr uint32_t CURRENT_LOOP_PERIOD_US = 500;   // 2 kHz
 static constexpr uint32_t VELOCITY_LOOP_PERIOD_US = 5000; // 200 Hz
 static constexpr uint32_t POSITION_LOOP_PERIOD_US = 10000;// 100 Hz
-static float cascadeCurrentKp = 150.0f;      // PWM counts / A
+static float cascadeCurrentKp = 400.0f;      // PWM counts / A
 static float cascadeCurrentKi = 1800.0f;     // PWM counts / (A*s)
-static float cascadeVelocityKp = 0.0015f;    // A / (deg/s)
-static float cascadeVelocityKi = 0.0005f;    // A / deg
-static float cascadeVelocityFrictionA = 0.65f; // identified Coulomb friction feedforward
-static float cascadePositionKp = 3.0f;       // (deg/s) / deg
+static float cascadeVelocityKp = 0.0005f;    // A / (deg/s)
+static float cascadeVelocityKi = 0.0002f;    // A / deg
+static float cascadeVelocityFrictionA = 2.0f; // measured breakaway current only
+static float cascadePositionKp = 8.0f;       // (deg/s) / deg
 static float cascadePositionKi = 0.0f;       // (deg/s) / (deg*s)
-static float cascadePositionKd = 0.0f;       // (deg/s) / (deg/s)
+static float cascadePositionKd = 0.5f;       // (deg/s) / (deg/s)
 static float cascadePositionReverseKdScale = 1.0f;
-static float cascadePositionMaxVelocityDps = 1200.0f;
-static float cascadePositionMinVelocityDps = 150.0f;
-static float cascadePositionDeadbandDeg = 2.0f;
+static float cascadePositionMaxVelocityDps = 3000.0f;
+static float cascadePositionMinVelocityDps = 1200.0f;
+static float cascadePositionDeadbandDeg = 3.0f;
 static float cascadeVelocityMaxCurrentA = 3.0f;
 static float cascadeCurrentMaxPwm = 1500.0f;
 static float cascadeVelocityRequestedDps = 0.0f;
@@ -232,9 +246,9 @@ static float cascadeVelocityIntegral = 0.0f;
 static float cascadeCurrentIntegral = 0.0f;
 static float cascadeVelocityBreakawayA = 0.0f;
 static bool cascadeVelocityStictionActive = false;
-static float cascadeVelocityCurrentSlewAps = 3.0f;
-static float cascadeVelocityBrakeSlewMultiplier = 4.0f;
-static float cascadePositionMaxAccelerationDps2 = 1600.0f;
+static float cascadeVelocityCurrentSlewAps = 6.0f;
+static float cascadeVelocityBrakeSlewMultiplier = 20.0f;
+static float cascadePositionMaxAccelerationDps2 = 6000.0f;
 static float cascadeBusVoltage = 0.0f;
 static uint32_t cascadeLastCurrentUs = 0;
 static uint32_t cascadeLastVelocityUs = 0;
@@ -285,6 +299,11 @@ static uint32_t syncLastRxUs = 0;
 static uint8_t syncSequence = 0;
 static uint32_t syncTxCount = 0;
 static uint32_t syncRxCount = 0;
+static uint32_t syncRequestTxCount = 0;
+static uint32_t syncResponseTxCount = 0;
+static uint32_t syncRequestRxCount = 0;
+static uint32_t syncResponseRxCount = 0;
+static bool syncLinkFailed = false;
 static uint32_t syncTimeoutCount = 0;
 static bool syncControlRunning = false;
 static float syncRemotePositionDeg = 0.0f;
@@ -306,7 +325,7 @@ class DualConsole final : public Print {
   size_t write(uint8_t byte) override {
     const size_t a = Serial.write(byte);
     if (USB_ONLY_BRINGUP) return a;
-    const size_t b = Serial1.write(byte);
+    const size_t b = BusSerial.write(byte);
     return (a && b) ? 1 : 0;
   }
 };
@@ -790,19 +809,29 @@ static void rlsUpdate2(float theta[2], float covariance[2][2], float phi0, float
   covariance[1][1] = (c11 - k1 * (phi0 * c01 + phi1 * c11)) / forgetting;
 }
 
-static void updateMotorModel(float busV, float currentAmps, float velocityDps, uint16_t duty) {
-  if (!modelIdentificationEnabled || busV < 2.0f || duty < 40) return;
+static void updateMotorModel(float busV, float currentAmps, float velocityDps,
+                             int16_t signedPwm) {
+  if (!modelIdentificationEnabled || busV < 2.0f || abs(signedPwm) < 40) return;
   const uint32_t nowUs = micros();
   const float dt = modelPreviousSampleUs == 0 ? 0.0f :
                    static_cast<float>(nowUs - modelPreviousSampleUs) / 1000000.0f;
   modelPreviousSampleUs = nowUs;
-  const float current = currentAmps * static_cast<float>(modelDirectionSign);
-  const float omega = velocityDps * 0.01745329252f * static_cast<float>(modelDirectionSign);
-  const float appliedVoltage = busV * static_cast<float>(duty) / static_cast<float>(PWM_MAX);
+  // All three values are already expressed in controller coordinates:
+  // setModelPhase() maps positive controller torque through modelDirectionSign,
+  // currentSensePolarity maps INA240 current back to the same sign, and the
+  // encoder unwrap is the position coordinate. Applying modelDirectionSign a
+  // second time corrupts one board's fit. The old code also discarded PWM
+  // sign, so reverse samples tried to fit negative I/omega to positive volts.
+  const float current = currentAmps;
+  const float omega = velocityDps * 0.01745329252f;
+  const float appliedVoltage = busV * static_cast<float>(signedPwm) /
+                               static_cast<float>(PWM_MAX);
   if (fabsf(current) > 0.03f || fabsf(omega) > 5.0f) {
     rlsUpdate2(electricalTheta, electricalCovariance, current, omega, appliedVoltage);
     modelResistanceOhm = constrain(electricalTheta[0], 0.05f, 20.0f);
     modelKeVoltSecondsPerRad = constrain(electricalTheta[1], 0.0001f, 0.2f);
+    electricalTheta[0] = modelResistanceOhm;
+    electricalTheta[1] = modelKeVoltSecondsPerRad;
     if (++modelElectricalSamples > 20) modelHasElectricalFit = true;
   }
   if (dt > 0.0002f && dt < 0.1f && modelElectricalSamples > 20) {
@@ -875,7 +904,8 @@ static void modelControlTick() {
   const float currentAmps = readSignedCurrentMilliamps(currentMv) / 1000.0f;
   latestCurrentMilliamps = currentAmps * 1000.0f;
   const float measuredVelocityDps = encoderVelocityDegreesPerSecond;
-  updateMotorModel(busV, currentAmps, measuredVelocityDps, pwmDuty());
+  updateMotorModel(busV, currentAmps, measuredVelocityDps,
+                   commandedSignedPwmDuty);
 
   float velocityTargetDps = modelTargetVelocityDps;
   float positionError = 0.0f;
@@ -1249,24 +1279,25 @@ static void cascadeControlTick() {
                  fabsf(encoderVelocityDegreesPerSecond) > 250.0f) {
         cascadeVelocityStictionActive = false;
       }
-      const float runningFrictionA = min(cascadeVelocityFrictionA, 0.55f);
-      const float frictionAmplitudeA = cascadeVelocityStictionActive
-          ? cascadeVelocityFrictionA : runningFrictionA;
       cascadeVelocityBreakawayA = cascadeVelocityStictionActive
-          ? frictionAmplitudeA : 0.0f;
-      // Fade feed-forward to zero in the final few degrees for quiet hold.
-      // Static friction is a motor/bridge property, not the position loop's
-      // cruise-speed setting.  Using min_velocity (typically 500 deg/s) as
-      // this denominator attenuated the feed-forward to ~40% near the target,
-      // leaving the motor below its measured 5% PWM breakaway threshold. Reach
-      // full compensation by 100 deg/s, but still fade it to zero for a quiet
-      // active hold inside the final few degrees.
-      const float frictionBlend = constrain(
-          fabsf(cascadeVelocityCommandDps) / 100.0f, 0.0f, 1.0f);
-      const float velocityFeedForward =
-          cascadeVelocityCommandDps == 0.0f ? 0.0f :
-          copysignf(frictionAmplitudeA * frictionBlend,
-                    cascadeVelocityCommandDps);
+          ? cascadeVelocityFrictionA : 0.0f;
+      // The configured friction current is only the measured breakaway kick.
+      // Once moving, use the identified mechanical model instead of injecting
+      // a constant 0.55 A forever. For alpha=(Kt/J)I-(B/J)omega, the current
+      // required to cancel running drag is (B/Kt)omega = theta1/theta0*omega.
+      float runningFeedForwardA = 0.0f;
+      if (modelHasMechanicalFit && mechanicalTheta[0] > 1.0f) {
+        const float requestedOmega = cascadeVelocityCommandDps * 0.01745329252f;
+        runningFeedForwardA = mechanicalTheta[1] / mechanicalTheta[0] *
+                              requestedOmega;
+        runningFeedForwardA = constrain(runningFeedForwardA,
+            -cascadeVelocityFrictionA, cascadeVelocityFrictionA);
+      }
+      const float velocityFeedForward = cascadeVelocityStictionActive
+          ? (cascadeVelocityCommandDps == 0.0f ? 0.0f :
+             copysignf(cascadeVelocityFrictionA,
+                       cascadeVelocityCommandDps))
+          : runningFeedForwardA;
       const float velocityIntegralLimit = cascadeVelocityKi > 0.0000001f
           ? cascadeVelocityMaxCurrentA / cascadeVelocityKi
           : 10000.0f;
@@ -1429,7 +1460,7 @@ static void identificationTick() {
   const float currentMv = filterCurrentSenseMillivolts(readCurrentSenseMillivolts());
   latestCurrentMilliamps = readSignedCurrentMilliamps(currentMv);
   updateMotorModel(busV, latestCurrentMilliamps / 1000.0f,
-                   encoderVelocityDegreesPerSecond, pwmDuty());
+                   encoderVelocityDegreesPerSecond, commandedSignedPwmDuty);
 }
 
 static float wrappedAngleError(float target, float actual) {
@@ -1712,6 +1743,11 @@ static bool saveBusAddress(uint8_t address) {
 static void busSendFrame(uint8_t destination, uint8_t type, uint8_t sequence,
                          const uint8_t *payload, uint8_t payloadLength) {
   if (payloadLength > BUS_MAX_PAYLOAD) return;
+  ++busFrameTxCount;
+  if (type == BUS_TYPE_RESPONSE || type == BUS_TYPE_STATUS ||
+      type == BUS_TYPE_PONG || type == BUS_TYPE_SYNC) {
+    ++busResponseTxCount;
+  }
   uint8_t frame[10 + BUS_MAX_PAYLOAD] = {};
   frame[0] = BUS_MAGIC_1;
   frame[1] = BUS_MAGIC_2;
@@ -1725,8 +1761,9 @@ static void busSendFrame(uint8_t destination, uint8_t type, uint8_t sequence,
   const uint16_t crc = busCrc16(frame + 2, 6 + payloadLength);
   frame[8 + payloadLength] = static_cast<uint8_t>(crc & 0xFF);
   frame[9 + payloadLength] = static_cast<uint8_t>(crc >> 8);
-  Serial1.write(frame, 10 + payloadLength);
-  Serial1.flush();
+  const size_t frameLength = 10 + payloadLength;
+  BusSerial.write(frame, frameLength);
+  BusSerial.flush();
 }
 
 static const char *syncModeName() {
@@ -1742,6 +1779,11 @@ static void syncResetLinkCounters() {
   syncSequence = 0;
   syncTxCount = 0;
   syncRxCount = 0;
+  syncRequestTxCount = 0;
+  syncResponseTxCount = 0;
+  syncRequestRxCount = 0;
+  syncResponseRxCount = 0;
+  syncLinkFailed = false;
   syncTimeoutCount = 0;
   syncControlRunning = false;
   syncRemotePositionDeg = 0.0f;
@@ -1787,6 +1829,8 @@ static void syncSendState(uint8_t kind) {
                reinterpret_cast<const uint8_t *>(&payload), sizeof(payload));
   syncLastTxUs = payload.timestampUs;
   ++syncTxCount;
+  if (kind == 0) ++syncRequestTxCount;
+  else ++syncResponseTxCount;
 }
 
 static void syncApplyRemoteState() {
@@ -1798,12 +1842,31 @@ static void syncApplyRemoteState() {
     // A synchronized pair is fail-safe on either side. The leader also has
     // to stop its local trajectory when its follower disappears; otherwise a
     // later reconnect could resume with a stale phase/target.
-    if (syncControlRunning || leader) {
+    if (!syncLinkFailed && (syncControlRunning || leader)) {
+      Console.printf("SYNC_STOP local_awake=%d remote_awake=%d remote_fault=%d age=%luus leader=%d\n",
+                    driverAwake ? 1 : 0, syncRemoteAwake ? 1 : 0,
+                    syncRemoteFault ? 1 : 0,
+                    static_cast<unsigned long>(syncLastRxUs == 0 ? 0 : nowUs - syncLastRxUs),
+                    leader ? 1 : 0);
+      // Remove motor torque immediately, but keep the synchronization session
+      // armed. A hard motorStop() used to disarm both nodes permanently at the
+      // first 30 ms burst of motor EMI, so the requester stopped transmitting
+      // and the link could never recover after the bridge went quiet.
+      const bool keepSyncArmed = syncMotionArmed;
       motorStop();
+      syncMotionArmed = keepSyncArmed;
       syncControlRunning = false;
+      syncLinkFailed = true;
       ++syncTimeoutCount;
     }
     return;
+  }
+
+  if (syncLinkFailed) {
+    syncLinkFailed = false;
+    Console.printf("SYNC_RECOVER age=%luus leader=%d\n",
+                  static_cast<unsigned long>(nowUs - syncLastRxUs),
+                  leader ? 1 : 0);
   }
 
   if (syncMode == SYNC_POSITION) {
@@ -1848,6 +1911,7 @@ static void syncApplyRemoteState() {
     const float limitedMa = constrain(commandedMa, -syncCurrentLimitMa,
                                       syncCurrentLimitMa);
     if (!syncControlRunning || controlMode != CONTROL_CURRENT) {
+      setCurrentStep(3);
       resetCascadeController();
       modelControlActive = true;
       controlMode = CONTROL_CURRENT;
@@ -1870,6 +1934,10 @@ static void syncHandleFrame(uint8_t source, const uint8_t *payloadBytes,
   SyncWirePayload payload = {};
   memcpy(&payload, payloadBytes, sizeof(payload));
   if (payload.version != SYNC_PAYLOAD_VERSION || payload.kind > 1) return;
+  // The lower address is the only requester and the higher address is the only
+  // responder. Reject an unexpected role before it refreshes the watchdog.
+  const bool leader = busAddress < syncPeerAddress;
+  if ((leader && payload.kind != 1) || (!leader && payload.kind != 0)) return;
   syncRemotePositionDeg = payload.positionDeg;
   syncRemoteVelocityDps = payload.velocityDps;
   syncRemoteCurrentMa = payload.currentMa;
@@ -1881,6 +1949,8 @@ static void syncHandleFrame(uint8_t source, const uint8_t *payloadBytes,
   syncRemoteAwake = payload.awake;
   syncLastRxUs = micros();
   ++syncRxCount;
+  if (payload.kind == 0) ++syncRequestRxCount;
+  else ++syncResponseRxCount;
   syncApplyRemoteState();
   if (payload.kind == 0) syncSendState(1);
 }
@@ -1970,29 +2040,32 @@ static void busHandleCommand(uint8_t source, uint8_t sequence, uint8_t destinati
                              const String &command);
 static void handleCommand(String cmd);
 
-static void busHandleFrame(const uint8_t *frame, uint16_t frameLength) {
+static bool busHandleFrame(const uint8_t *frame, uint16_t frameLength) {
   if (frameLength < 10 || frame[0] != BUS_MAGIC_1 || frame[1] != BUS_MAGIC_2 ||
       frame[2] != BUS_VERSION || frame[7] > BUS_MAX_PAYLOAD ||
-      frameLength != static_cast<uint16_t>(10 + frame[7])) return;
+      frameLength != static_cast<uint16_t>(10 + frame[7])) return false;
   const uint16_t receivedCrc = static_cast<uint16_t>(frame[8 + frame[7]]) |
                                static_cast<uint16_t>(frame[9 + frame[7]]) << 8;
   const uint16_t calculatedCrc = busCrc16(frame + 2, 6 + frame[7]);
   if (receivedCrc != calculatedCrc) {
-    Console.printf("BUS_ERR crc from=%u\n", static_cast<unsigned>(frame[4]));
-    return;
+    ++busCrcErrorCount;
+    return false;
   }
+  ++busValidFrameCount;
   const uint8_t destination = frame[3];
-  if (destination != busAddress && destination != BUS_BROADCAST) return;
+  if (destination != busAddress && destination != BUS_BROADCAST) return true;
+  ++busAddressedFrameCount;
   const uint8_t source = frame[4];
   const uint8_t sequence = frame[5];
   const uint8_t type = frame[6];
   if (type == BUS_TYPE_SYNC) {
     syncHandleFrame(source, frame + 8, frame[7]);
-    return;
+    return true;
   }
   String payload;
   for (uint8_t i = 0; i < frame[7]; ++i) payload += static_cast<char>(frame[8 + i]);
   if (type == BUS_TYPE_COMMAND) {
+    ++busCommandRxCount;
     busHandleCommand(source, sequence, destination, payload);
   } else {
     if (type != BUS_TYPE_SYNC && busTransactionActive && source == busPendingDestination &&
@@ -2006,38 +2079,78 @@ static void busHandleFrame(const uint8_t *frame, uint16_t frameLength) {
                    static_cast<unsigned>(source), static_cast<unsigned>(type),
                    static_cast<unsigned>(sequence), payload.c_str());
   }
+  return true;
 }
 
-static void busProcessRx() {
+static void busResyncFrame(uint8_t *frame, uint16_t &received) {
+  ++busResyncCount;
+  for (uint16_t index = 1; index + 1 < received; ++index) {
+    if (frame[index] == BUS_MAGIC_1 && frame[index + 1] == BUS_MAGIC_2) {
+      const uint16_t remaining = received - index;
+      memmove(frame, frame + index, remaining);
+      received = remaining;
+      return;
+    }
+  }
+  if (received != 0 && frame[received - 1] == BUS_MAGIC_1) {
+    frame[0] = BUS_MAGIC_1;
+    received = 1;
+  } else {
+    received = 0;
+  }
+}
+
+static void busProcessByte(uint8_t byte) {
   static uint8_t frame[10 + BUS_MAX_PAYLOAD] = {};
   static uint16_t received = 0;
-  while (Serial1.available()) {
-    const uint8_t byte = static_cast<uint8_t>(Serial1.read());
-    if (received == 0) {
-      if (byte == BUS_MAGIC_1) frame[received++] = byte;
-      continue;
-    }
-    if (received == 1 && byte != BUS_MAGIC_2) {
-      received = byte == BUS_MAGIC_1 ? 1 : 0;
-      if (received) frame[0] = byte;
-      continue;
-    }
-    if (received >= sizeof(frame)) {
+  ++busRxByteCount;
+  if (received >= sizeof(frame)) {
+    busResyncFrame(frame, received);
+    if (received >= sizeof(frame)) received = 0;
+  }
+  frame[received++] = byte;
+  bool inspectAgain = true;
+  while (inspectAgain) {
+    inspectAgain = false;
+    if (received == 1 && frame[0] != BUS_MAGIC_1) {
       received = 0;
       continue;
     }
-    frame[received++] = byte;
+    if (received >= 2 &&
+        (frame[0] != BUS_MAGIC_1 || frame[1] != BUS_MAGIC_2)) {
+      busResyncFrame(frame, received);
+      inspectAgain = received >= 2;
+      continue;
+    }
+    if (received >= 3 && frame[2] != BUS_VERSION) {
+      busResyncFrame(frame, received);
+      inspectAgain = received >= 2;
+      continue;
+    }
     if (received >= 8) {
       const uint16_t expected = static_cast<uint16_t>(10 + frame[7]);
       if (frame[7] > BUS_MAX_PAYLOAD || expected > sizeof(frame)) {
-        received = 0;
+        busResyncFrame(frame, received);
+        inspectAgain = received >= 2;
         continue;
       }
-      if (received == expected) {
-        busHandleFrame(frame, received);
-        received = 0;
+      if (received >= expected) {
+        if (busHandleFrame(frame, expected)) {
+          const uint16_t remaining = received - expected;
+          if (remaining) memmove(frame, frame + expected, remaining);
+          received = remaining;
+        } else {
+          busResyncFrame(frame, received);
+        }
+        inspectAgain = received != 0;
       }
     }
+  }
+}
+
+static void busProcessRx() {
+  while (BusSerial.available()) {
+    busProcessByte(static_cast<uint8_t>(BusSerial.read()));
   }
 }
 
@@ -2331,10 +2444,19 @@ static void handleCommand(String cmd) {
     Console.printf("ADC bus=%.0fmV bus_calc=%.3fV current_raw=%.0fmV current_filtered=%.0fmV signed=%.0fmA\n",
                   busMv, busV, currentRawMv, currentMv, readSignedCurrentMilliamps(currentMv));
   } else if (op == "businfo") {
-    Console.printf("BUS addr=%u uid=%llX baud=%lu framing=B5 2B v1 CRC16 DATA=BUS_TX/BUS_RX\n",
+    Console.printf("BUS addr=%u uid=%llX baud=%lu framing=B5 2B v1 CRC16 DATA=BUS_TX/BUS_RX transport=proven-hardware-serial crc_err=%lu resync=%lu uart_err=%lu rx_bytes=%lu valid=%lu addressed=%lu cmd_rx=%lu tx=%lu response_tx=%lu\n",
                   static_cast<unsigned>(busAddress),
                   static_cast<unsigned long long>(ESP.getEfuseMac()),
-                  static_cast<unsigned long>(busBaudrate));
+                  static_cast<unsigned long>(busBaudrate),
+                  static_cast<unsigned long>(busCrcErrorCount),
+                  static_cast<unsigned long>(busResyncCount),
+                  static_cast<unsigned long>(busUartErrorCount),
+                  static_cast<unsigned long>(busRxByteCount),
+                  static_cast<unsigned long>(busValidFrameCount),
+                  static_cast<unsigned long>(busAddressedFrameCount),
+                  static_cast<unsigned long>(busCommandRxCount),
+                  static_cast<unsigned long>(busFrameTxCount),
+                  static_cast<unsigned long>(busResponseTxCount));
   } else if (op == "busbaud") {
     int requested = 0;
     if (!parseUInt(rest, requested) ||
@@ -2346,8 +2468,8 @@ static void handleCommand(String cmd) {
     busTransactionActive = false;
     syncMotionArmed = false;
     syncControlRunning = false;
-    Serial1.flush();
-    Serial1.updateBaudRate(static_cast<uint32_t>(requested));
+    BusSerial.flush();
+    BusSerial.updateBaudRate(static_cast<uint32_t>(requested));
     busBaudrate = static_cast<uint32_t>(requested);
     Console.printf("OK busbaud=%lu\n", static_cast<unsigned long>(busBaudrate));
   } else if (op == "busaddr") {
@@ -2423,15 +2545,20 @@ static void handleCommand(String cmd) {
                     static_cast<unsigned long>(SYNC_PERIOD_US));
     } else if (rest == "status") {
       const uint32_t ageUs = syncLastRxUs == 0 ? 0 : micros() - syncLastRxUs;
-      Console.printf("SYNC mode=%s peer=%u armed=%d leader=%d period=%luus age=%luus tx=%lu rx=%lu timeout=%lu remote_pos=%.2f remote_cmd=%.2f remote_vel=%.1f remote_current=%.0fmA\n",
+      Console.printf("SYNC mode=%s peer=%u armed=%d leader=%d period=%luus age=%luus tx=%lu(%lu/%lu) rx=%lu(%lu/%lu) timeout=%lu offset=%.2f remote_pos=%.2f remote_cmd=%.2f remote_vel=%.1f remote_current=%.0fmA\n",
                     syncModeName(), static_cast<unsigned>(syncPeerAddress),
                     syncMotionArmed ? 1 : 0,
                     syncPeerAddress != 0 && busAddress < syncPeerAddress ? 1 : 0,
                     static_cast<unsigned long>(SYNC_PERIOD_US),
                     static_cast<unsigned long>(ageUs),
                     static_cast<unsigned long>(syncTxCount),
+                    static_cast<unsigned long>(syncRequestTxCount),
+                    static_cast<unsigned long>(syncResponseTxCount),
                     static_cast<unsigned long>(syncRxCount),
+                    static_cast<unsigned long>(syncRequestRxCount),
+                    static_cast<unsigned long>(syncResponseRxCount),
                     static_cast<unsigned long>(syncTimeoutCount),
+                    syncPositionOffsetDeg,
                     syncRemotePositionDeg, syncRemoteCommandPositionDeg,
                     syncRemoteVelocityDps,
                     syncRemoteCurrentMa);
@@ -2461,15 +2588,19 @@ static void handleCommand(String cmd) {
     } else if (rest.startsWith("force ")) {
       int peer = 0, duty = 0, timeout = 0;
       float stiffness = 0.0f, damping = 0.0f, reflection = 0.0f, limit = 0.0f;
-      if (sscanf(rest.c_str(), "force %d %f %f %f %f %d %d", &peer, &stiffness,
-                 &damping, &reflection, &limit, &duty, &timeout) != 7 ||
+      float offset = 0.0f;
+      const int parsed = sscanf(rest.c_str(), "force %d %f %f %f %f %d %d %f",
+                                &peer, &stiffness, &damping, &reflection,
+                                &limit, &duty, &timeout, &offset);
+      if ((parsed != 7 && parsed != 8) ||
           peer < 1 || peer > 254 || peer == busAddress || !isfinite(stiffness) ||
-          !isfinite(damping) || !isfinite(reflection) || !isfinite(limit) ||
+          !isfinite(damping) || !isfinite(reflection) || !isfinite(limit) || !isfinite(offset) ||
           stiffness < 0.0f || stiffness > 1000.0f || damping < 0.0f ||
           damping > 1000.0f || reflection < 0.0f || reflection > 4.0f ||
-          limit < 10.0f || limit > 3000.0f || duty < 12 || duty > TEST_DUTY_MAX ||
+          limit < 10.0f || limit > 4500.0f || fabsf(offset) > 360.0f ||
+          duty < 12 || duty > TEST_DUTY_MAX ||
           timeout < 100 || timeout > 30000) {
-        Console.println("ERR usage: sync force PEER KP_MA_PER_DEG KD_MA_PER_DPS REFLECT_GAIN LIMIT_MA MAX_DUTY TIMEOUT_MS");
+        Console.println("ERR usage: sync force PEER KP_MA_PER_DEG KD_MA_PER_DPS REFLECT_GAIN LIMIT_MA MAX_DUTY TIMEOUT_MS [OFFSET_DEG]");
         return;
       }
       motorStop();
@@ -2479,22 +2610,25 @@ static void handleCommand(String cmd) {
       syncDampingMaPerDps = damping;
       syncReflectionGain = reflection;
       syncCurrentLimitMa = limit;
+      syncPositionOffsetDeg = offset;
       syncMaxDuty = static_cast<uint16_t>(duty);
       syncTimeoutMs = static_cast<uint32_t>(timeout);
       syncResetLinkCounters();
       syncMotionArmed = true;
-      Console.printf("OK sync_config mode=force peer=%u kp=%.3f kd=%.3f reflect=%.3f limit=%.0fmA duty=%u timeout=%lu\n",
+      Console.printf("OK sync_config mode=force peer=%u kp=%.3f kd=%.3f reflect=%.3f limit=%.0fmA duty=%u timeout=%lu offset=%.2f\n",
                     static_cast<unsigned>(syncPeerAddress), syncStiffnessMaPerDeg,
                     syncDampingMaPerDps, syncReflectionGain, syncCurrentLimitMa,
                     static_cast<unsigned>(syncMaxDuty),
-                    static_cast<unsigned long>(syncTimeoutMs));
+                    static_cast<unsigned long>(syncTimeoutMs), syncPositionOffsetDeg);
     } else {
-      Console.println("ERR usage: sync off|stop|disarm|arm|status|position PEER OFFSET_DEG MAX_DUTY TIMEOUT_MS|force PEER KP_MA_PER_DEG KD_MA_PER_DPS REFLECT_GAIN LIMIT_MA MAX_DUTY TIMEOUT_MS");
+      Console.println("ERR usage: sync off|stop|disarm|arm|status|position PEER OFFSET_DEG MAX_DUTY TIMEOUT_MS|force PEER KP_MA_PER_DEG KD_MA_PER_DPS REFLECT_GAIN LIMIT_MA MAX_DUTY TIMEOUT_MS [OFFSET_DEG]");
     }
   } else if (op == "model") {
-    Console.printf("MODEL enabled=%d identify=%d direction=%s R=%.5fOhm Ke=%.6fV/(rad/s) accel_per_A=%.2f(rad/s2)/A friction=%.4f samples=%lu/%lu\n",
+    Console.printf("MODEL fw=%s enabled=%d identify=%d direction=%s sense=%s R=%.5fOhm Ke=%.6fV/(rad/s) accel_per_A=%.2f(rad/s2)/A friction=%.4f samples=%lu/%lu\n",
+                  FW_VERSION,
                   modelControlActive ? 1 : 0, modelIdentificationEnabled ? 1 : 0,
                   modelDirectionSign < 0 ? "invert" : "normal",
+                  currentSensePolarity < 0 ? "invert" : "normal",
                   modelResistanceOhm, modelKeVoltSecondsPerRad, mechanicalTheta[0], mechanicalTheta[1],
                   static_cast<unsigned long>(modelElectricalSamples), static_cast<unsigned long>(modelMechanicalSamples));
   } else if (op == "direction") {
@@ -2707,7 +2841,7 @@ void setup() {
   }
   // BUS_TX/BUS_RX is the board's auto-direction single-wire bus console.
   // It is not the ESP32 ROM download port; flashing is done over native USB.
-  Serial1.begin(busBaudrate, SERIAL_8N1, PIN_BUS_RX, PIN_BUS_TX);
+  BusSerial.begin(busBaudrate, SERIAL_8N1, PIN_BUS_RX, PIN_BUS_TX);
   loadBusAddress();
   Serial.begin(115200);
   delay(250);
@@ -2741,8 +2875,8 @@ void loop() {
     motorStop();
     Console.println("AUTO stop");
   }
-  while (Serial.available() || (!USB_ONLY_BRINGUP && Serial1.available())) {
-    const char ch = static_cast<char>(Serial.available() ? Serial.read() : Serial1.read());
+  while (Serial.available()) {
+    const char ch = static_cast<char>(Serial.read());
     if (ch == '\n' || ch == '\r') {
       handleCommand(line);
       line = String();

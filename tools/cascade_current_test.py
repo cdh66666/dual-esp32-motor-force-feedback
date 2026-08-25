@@ -45,7 +45,7 @@ def main() -> int:
     parser.add_argument("--port", required=True, help="Freshly enumerated USB CDC port")
     parser.add_argument("--target", type=float, default=500.0)
     parser.add_argument("--duration", type=float, default=1.5)
-    parser.add_argument("--kp", type=float, default=150.0)
+    parser.add_argument("--kp", type=float, default=400.0)
     parser.add_argument("--ki", type=float, default=1800.0)
     parser.add_argument("--max-pwm", type=float, default=1500.0)
     parser.add_argument("--drive", choices=("sign", "locked"), default="sign")

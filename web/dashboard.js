@@ -17,7 +17,7 @@ const CHARTS = {
   velocity: { title: '速度', color: COLORS.velocity, smooth: 0.18 },
   current: { title: 'INA240 电机支路电流', color: COLORS.current, fixed: [-5, 5], smooth: 0.25 },
   pwm: { title: '有符号 PWM', color: COLORS.pwm, fixed: [-4095, 4095], smooth: 0.35 },
-  bus: { title: '母线电压', color: COLORS.bus, fixed: [0, 15], smooth: 0.12 }
+  bus: { title: '母线电压', color: COLORS.bus, fixed: [0, 30], smooth: 0.12 }
 };
 
 const PARAM_SLIDERS = new Set([
@@ -131,12 +131,12 @@ function boardHtml(board) {
     '<section class="loop-controls"><h3>③ 位置环 · 100 Hz</h3>',
     slider('positionTarget', '目标多圈位置', -36000, 36000, 1, 0),
     '<div class="compact-sliders">',
-    slider('positionKp', 'Kp（°/s / °）', 0, 12, 0.05, 3),
+    slider('positionKp', 'Kp（°/s / °）', 0, 20, 0.05, 8),
     slider('positionKi', 'Ki', 0, 2, 0.005, 0),
-    slider('positionKd', 'Kd', 0, 5, 0.01, 0),
-    slider('positionMaxVelocity', '最大速度 °/s', 100, 6000, 10, 1200),
-    slider('positionMinVelocity', '脱困最小速度 °/s', 0, 600, 5, 150),
-    slider('positionDeadband', '到位死区 °', 0.1, 10, 0.1, 2),
+    slider('positionKd', 'Kd', 0, 5, 0.01, 0.5),
+    slider('positionMaxVelocity', '最大速度 °/s', 100, 6000, 10, 3000),
+    slider('positionMinVelocity', '脱困最小速度 °/s', 0, 2000, 10, 1200),
+    slider('positionDeadband', '到位死区 °', 0.1, 10, 0.1, 3),
     '</div><div class="row"><button data-act="holdZero" class="primary">闭环保持 0°</button>',
     '<button data-act="positionTest">自动 360° 往返测试</button></div>',
     '<p class="hint">滑动目标即发送；目标范围 ±100 圈。位置环输出速度目标，不直接输出 PWM。</p></section></div>',
@@ -145,16 +145,16 @@ function boardHtml(board) {
     '<section class="loop-controls"><h3>② 速度环 · 200 Hz</h3>',
     slider('velocityTarget', '目标速度', -10000, 10000, 10, 0),
     '<div class="compact-sliders">',
-    slider('velocityKp', 'Kp（A / (°/s)）', 0, 0.005, 0.00005, 0.0015),
-    slider('velocityKi', 'Ki', 0, 0.005, 0.00005, 0.0005),
+    slider('velocityKp', 'Kp（A / (°/s)）', 0, 0.005, 0.00005, 0.0005),
+    slider('velocityKi', 'Ki', 0, 0.005, 0.00005, 0.0002),
     slider('velocityMaxCurrent', '最大电流 A', 0.1, 4.5, 0.05, 3),
-    slider('velocityFriction', '摩擦前馈 A', 0, 2, 0.01, 0.65),
+    slider('velocityFriction', '静止脱困电流 A', 0, 3, 0.01, 2),
     '</div><p class="hint">速度环输出电流目标；两块相同板使用同一组控制参数。</p></section></div>',
     '<div class="loop-block">', chart('current'),
     '<section class="loop-controls"><h3>① 电流环 · 2 kHz</h3>',
     slider('currentTarget', '目标电流', -4500, 4500, 10, 0),
     '<div class="compact-sliders">',
-    slider('currentKp', 'Kp（PWM/A）', 0, 1500, 1, 150),
+    slider('currentKp', 'Kp（PWM/A）', 0, 1500, 1, 400),
     slider('currentKi', 'Ki（PWM/(A·s)）', 0, 5000, 10, 1800),
     slider('currentMaxPwm', '电流环最大 PWM', 1, 4095, 1, 1500),
     '</div><p class="hint">这是电机支路/绕组电流，不等于电源平均输入电流。INA240A1 ×20、10 mΩ；SS6952T 板级内部限流约 5 A，软件最多 4.5 A。</p></section></div>',
@@ -266,11 +266,11 @@ async function applyCascade(board, notify = true) {
     valueOf(board, 'currentKi') + ' ' + valueOf(board, 'currentMaxPwm'));
   await send(board.port, 'cascade velocity ' + valueOf(board, 'velocityKp') + ' ' +
     valueOf(board, 'velocityKi') + ' ' + valueOf(board, 'velocityMaxCurrent') + ' ' +
-    valueOf(board, 'velocityFriction'));
+    valueOf(board, 'velocityFriction') + ' 6 20');
   await send(board.port, 'cascade position ' + valueOf(board, 'positionKp') + ' ' +
     valueOf(board, 'positionKi') + ' ' + valueOf(board, 'positionKd') + ' ' +
     valueOf(board, 'positionMaxVelocity') + ' ' + valueOf(board, 'positionDeadband') + ' ' +
-    valueOf(board, 'positionMinVelocity'));
+    valueOf(board, 'positionMinVelocity') + ' 6000 1');
   board.configApplied = true;
   if (notify) toast(board.port + ': 三环参数已应用');
 }
@@ -415,10 +415,15 @@ function parseLine(board, text) {
   }
   const address = text.match(/BUS addr=(\d+)/);
   if (address) board.busAddress = Number(address[1]);
-  if (/^(DIAG|ERR|MODEL|CASCADE_CFG|BUS_|SYNC_)/.test(text)) {
+  if (/^(DIAG|ERR|MODEL|CASCADE_CFG|BUS_|SYNC_|SYNC )/.test(text)) {
     const health = $('[data-health]', board.root);
     health.textContent = text;
     health.className = 'health ' + (text.startsWith('ERR') ? 'bad' : 'good');
+    if (text.startsWith('SYNC mode=force')) {
+      const state = $('#forceState');
+      state.textContent = board.port + ' · ' + text;
+      state.className = text.includes('armed=1') && !text.includes('timeout=1') ? 'good' : 'bad';
+    }
   }
 }
 
@@ -664,6 +669,67 @@ $('#fleetSend').addEventListener('click', () => {
   const target = Number($('#fleetTarget').value);
   Promise.all([...boards.values()].filter(board => board.active).map(board => runMotion(board, 'position', target))).catch(() => {});
 });
+
+function updateForceOutputs() {
+  $('#forceKOut').textContent = Number($('#forceK').value).toFixed(1) + ' mA/°';
+  $('#forceDOut').textContent = Number($('#forceD').value).toFixed(2) + ' mA/(°/s)';
+  $('#forceLimitOut').textContent = Math.round(Number($('#forceLimit').value)) + ' mA';
+}
+
+async function forcePair() {
+  let pair = [...boards.values()].filter(board => board.active);
+  if (pair.length !== 2) throw new Error('需要恰好两块在线板');
+  await Promise.all(pair.map(board => send(board.port, 'businfo')));
+  await pause(250);
+  pair = pair.filter(board => Number.isInteger(board.busAddress));
+  if (pair.length !== 2 || pair[0].busAddress === pair[1].busAddress) {
+    throw new Error('两块板必须具有不同 DATA 地址');
+  }
+  return pair;
+}
+
+async function startForceFeedback() {
+  const state = $('#forceState');
+  state.textContent = '正在建立 1 Mbaud 双向链路…';
+  state.className = '';
+  const pair = await forcePair();
+  await Promise.all(pair.map(async board => {
+    await send(board.port, 'stop');
+    await ensureReady(board);
+  }));
+  const stiffness = Number($('#forceK').value);
+  const damping = Number($('#forceD').value);
+  const limit = Number($('#forceLimit').value);
+  // Configure the higher address first. It only responds; configuring the
+  // lower-address request owner last avoids a false startup timeout.
+  const ordered = [...pair].sort((a, b) => b.busAddress - a.busAddress);
+  for (const board of ordered) {
+    const peer = pair.find(item => item !== board);
+    await send(board.port, 'sync force ' + peer.busAddress + ' ' + stiffness + ' ' +
+      damping + ' 0 ' + limit + ' 1500 30000 0');
+    await pause(80);
+  }
+  await pause(250);
+  await Promise.all(pair.map(board => send(board.port, 'sync status')));
+  state.textContent = '双向力反馈运行中 · 任一链路超时会双板 PWM=0';
+  state.className = 'good';
+}
+
+async function stopForceFeedback() {
+  const pair = [...boards.values()].filter(board => board.active);
+  await Promise.all(pair.map(board => send(board.port, 'sync stop')));
+  $('#forceState').textContent = '力反馈已停止 · PWM=0';
+  $('#forceState').className = '';
+}
+
+['forceK', 'forceD', 'forceLimit'].forEach(id => $('#' + id).addEventListener('input', updateForceOutputs));
+$('#forceStart').addEventListener('click', () => startForceFeedback().catch(error => {
+  $('#forceState').textContent = error.message;
+  $('#forceState').className = 'bad';
+  toast('力反馈启动失败：' + error.message, true);
+}));
+$('#forceStop').addEventListener('click', () => stopForceFeedback().catch(error => toast(error.message, true)));
+updateForceOutputs();
 
 await refreshPorts();
 setInterval(refreshPorts, 1000);

@@ -21,6 +21,15 @@
     <button id="fleetSend" class="primary">两板同时发送位置</button>
     <span id="portSummary">正在检测真实端口…</span>
   </section>
+  <section class="haptic">
+    <strong>双向力反馈</strong>
+    <label>刚度 <output id="forceKOut">5 mA/°</output><input id="forceK" type="range" min="0" max="50" step="0.5" value="5"></label>
+    <label>阻尼 <output id="forceDOut">0.10 mA/(°/s)</output><input id="forceD" type="range" min="0" max="2" step="0.05" value="0.1"></label>
+    <label>电流上限 <output id="forceLimitOut">1000 mA</output><input id="forceLimit" type="range" min="100" max="4500" step="50" value="1000"></label>
+    <button id="forceStart" class="primary">启动双向力反馈</button>
+    <button id="forceStop" class="danger">停止力反馈</button>
+    <span id="forceState">等待两块板在线</span>
+  </section>
   <main id="boards"></main>
   <div id="toast"></div>
   <script type="module" src="/dashboard.js?v=cascade-1"></script>

@@ -137,6 +137,8 @@ class PortSession:
                 # Wake the driver with PWM=0 so the page is immediately usable.
                 # STOP remains available at all times; there is no UI ARM gate.
                 self.send("wake")
+                self.send("businfo")
+                self.send("model")
         except Exception as exc:
             self.add_log("error", f"stream start: {exc}")
         while not self.monitor_stop.wait(1.0):
@@ -241,7 +243,7 @@ def usb_problem_devices():
 
 def validate_command(command: str, _armed: bool = True):
     command = command.strip()
-    safe = {"help", "status", "diag", "encoder", "encreset", "rawadc", "model", "businfo", "wake", "sleep", "stop", "led on", "led off", "decay slow", "decay fast", "pospid on", "pospid off", "pospid status", "sync off", "sync stop", "sync disarm", "sync status"}
+    safe = {"help", "status", "diag", "encoder", "encreset", "rawadc", "model", "businfo", "wake", "sleep", "stop", "led on", "led off", "decay slow", "decay fast", "pospid on", "pospid off", "pospid status", "cascade status", "sync off", "sync stop", "sync disarm", "sync status"}
     if command in safe:
         return command
     if command == "sync arm":
@@ -249,8 +251,39 @@ def validate_command(command: str, _armed: bool = True):
     busbaud = re.fullmatch(r"busbaud\s+(115200|250000|500000|750000|1000000)", command)
     if busbaud:
         return f"busbaud {busbaud.group(1)}"
-    if re.fullmatch(r"sync (position|force)\s+.+", command):
-        return command
+    sync_position = re.fullmatch(
+        r"sync\s+position\s+(\d{1,3})\s+" +
+        r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s+(\d{1,4})\s+(\d{1,5})",
+        command,
+    )
+    if sync_position:
+        peer, offset, duty, timeout = (
+            int(sync_position.group(1)), float(sync_position.group(2)),
+            int(sync_position.group(3)), int(sync_position.group(4)),
+        )
+        if not 1 <= peer <= 254 or not math.isfinite(offset) or abs(offset) > 36000:
+            raise ValueError("invalid synchronized-position peer or offset")
+        if not 12 <= duty <= 4095 or not 100 <= timeout <= 30000:
+            raise ValueError("invalid synchronized-position duty or timeout")
+        return f"sync position {peer} {offset:g} {duty} {timeout}"
+    sync_force = re.fullmatch(
+        r"sync\s+force\s+(\d{1,3})\s+" +
+        r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s+" * 4 +
+        r"(\d{1,4})\s+(\d{1,5})(?:\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)))?",
+        command,
+    )
+    if sync_force:
+        peer = int(sync_force.group(1))
+        stiffness, damping, reflection, limit = map(float, sync_force.groups()[1:5])
+        duty, timeout = int(sync_force.group(6)), int(sync_force.group(7))
+        offset = float(sync_force.group(8) or 0.0)
+        if not 1 <= peer <= 254 or not all(math.isfinite(x) for x in (stiffness, damping, reflection, limit, offset)):
+            raise ValueError("invalid force-feedback peer or parameter")
+        if not 0 <= stiffness <= 1000 or not 0 <= damping <= 1000 or not 0 <= reflection <= 4:
+            raise ValueError("force-feedback gain outside firmware range")
+        if not 10 <= limit <= 4500 or not 12 <= duty <= 4095 or not 100 <= timeout <= 30000 or abs(offset) > 360:
+            raise ValueError("force-feedback limit, duty, timeout or offset outside range")
+        return f"sync force {peer} {stiffness:g} {damping:g} {reflection:g} {limit:g} {duty} {timeout} {offset:g}"
     busaddr = re.fullmatch(r"busaddr\s+([1-9]\d?|1\d\d|2[0-4]\d|25[0-4])", command)
     if busaddr:
         return f"busaddr {int(busaddr.group(1))}"
@@ -315,32 +348,40 @@ def validate_command(command: str, _armed: bool = True):
             raise ValueError("电流环范围：Kp 0..5000，Ki 0..100000，最大 PWM 1..4095")
         return f"cascade current {kp:g} {ki:g} {max_pwm:g}"
     cascade_velocity = re.fullmatch(
-        rf"cascade\s+velocity\s+{number}\s+{number}\s+{number}(?:\s+{number})?", command
+        rf"cascade\s+velocity\s+{number}\s+{number}\s+{number}"
+        rf"(?:\s+{number}(?:\s+{number}\s+{number})?)?", command
     )
     if cascade_velocity:
         values = [float(x) for x in cascade_velocity.groups() if x is not None]
         kp, ki, max_current = values[:3]
-        friction = values[3] if len(values) == 4 else 0.65
+        friction = values[3] if len(values) >= 4 else 2.0
+        current_slew = values[4] if len(values) >= 6 else 6.0
+        brake_slew = values[5] if len(values) >= 6 else 20.0
         if not all(math.isfinite(x) for x in values) or not (
             0 <= kp <= 1 and 0 <= ki <= 1 and 0.05 <= max_current <= 4.5 and 0 <= friction <= 3
+            and 0.1 <= current_slew <= 100 and 1 <= brake_slew <= 50
         ):
             raise ValueError("速度环范围：Kp/Ki 0..1，最大电流 0.05..4.5 A，摩擦前馈 0..3 A")
-        return f"cascade velocity {kp:g} {ki:g} {max_current:g} {friction:g}"
+        return f"cascade velocity {kp:g} {ki:g} {max_current:g} {friction:g} {current_slew:g} {brake_slew:g}"
     cascade_position = re.fullmatch(
-        rf"cascade\s+position\s+{number}\s+{number}\s+{number}\s+{number}\s+{number}(?:\s+{number})?",
+        rf"cascade\s+position\s+{number}\s+{number}\s+{number}\s+{number}\s+{number}"
+        rf"(?:\s+{number}(?:\s+{number}(?:\s+{number})?)?)?",
         command,
     )
     if cascade_position:
         values = [float(x) for x in cascade_position.groups() if x is not None]
         kp, ki, kd, max_velocity, deadband = values[:5]
-        min_velocity = values[5] if len(values) == 6 else 150.0
+        min_velocity = values[5] if len(values) >= 6 else 1200.0
+        acceleration = values[6] if len(values) >= 7 else 6000.0
+        reverse_kd = values[7] if len(values) >= 8 else 1.0
         if not all(math.isfinite(x) for x in values) or not (
             0 <= kp <= 1000 and 0 <= ki <= 1000 and 0 <= kd <= 100
             and 1 <= max_velocity <= 60000 and 0 <= deadband <= 360
             and 0 <= min_velocity <= max_velocity
+            and 1 <= acceleration <= 200000 and 0.1 <= reverse_kd <= 20
         ):
             raise ValueError("位置环范围：Kp/Ki 0..1000，Kd 0..100，速度 1..60000 °/s，死区 0..360°")
-        return f"cascade position {kp:g} {ki:g} {kd:g} {max_velocity:g} {deadband:g} {min_velocity:g}"
+        return f"cascade position {kp:g} {ki:g} {kd:g} {max_velocity:g} {deadband:g} {min_velocity:g} {acceleration:g} {reverse_kd:g}"
     # The MT6701 unwraps the single-turn reading into a float accumulator in
     # the firmware. Keep the UI contract consistent at +/-100 turns.
     position = re.fullmatch(
