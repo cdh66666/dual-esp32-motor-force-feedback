@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>双板三环电机调试台</title>
+  <link rel="stylesheet" href="/dashboard.css?v=cascade-1">
+  <link rel="stylesheet" href="/dashboard-cascade.css?v=cascade-1">
+</head>
+<body>
+  <header class="topbar">
+    <div><h1>双板三环电机调试台</h1><p>2 kHz 电流环 → 200 Hz 速度环 → 100 Hz 位置环 · USB 100 Hz 原始过程</p></div>
+    <div class="top-actions">
+      <label>显示单位 <select id="unit"><option value="deg">° / °/s</option><option value="rev">圈 / rps</option></select></label>
+      <button id="connectAll">连接全部</button><button id="stopAll" class="danger">全部 STOP</button>
+    </div>
+  </header>
+  <section class="fleet">
+    <strong>双板同步操作</strong>
+    <label>共同位置目标 <output id="fleetTargetOut">0°</output><input id="fleetTarget" type="range" min="-36000" max="36000" step="1" value="0"></label>
+    <button id="fleetSend" class="primary">两板同时发送位置</button>
+    <span id="portSummary">正在检测真实端口…</span>
+  </section>
+  <main id="boards"></main>
+  <div id="toast"></div>
+  <script type="module" src="/dashboard.js?v=cascade-1"></script>
+</body>
+</html>

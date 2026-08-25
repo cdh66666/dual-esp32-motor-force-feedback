@@ -1,0 +1,11 @@
+.pio/
+__pycache__/
+*.pyc
+*.log
+*.bin
+*.elf
+*.map
+captures/
+evidence/private/
+.env
+

@@ -1,0 +1,6 @@
+version=0.1.0-unified
+environment=esp32-s3-devkitc-1
+firmware_size_bytes=384832
+firmware_sha256=E3FA320EA34690C70BD21278FDC0E225BA1370A17292CDC9B130F1E682BC3C77
+build_result=SUCCESS
+notes=Single source and binary for both identical boards; device identity does not select gains.
