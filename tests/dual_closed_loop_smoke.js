@@ -13,6 +13,24 @@ const { chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-primary
   await page.goto(baseUrl + '/?v=dual-loop-smoke', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => [...document.querySelectorAll('[data-connected]')]
     .filter(element => element.textContent.includes('已连接')).length === 2);
+  await page.waitForFunction(() => {
+    const boards = [...document.querySelectorAll('.board')];
+    return boards.length === 2 && boards.every(board => {
+      const position = Number.parseFloat(board.querySelector('[data-metric="multi"]')?.textContent ?? '');
+      const rate = Number.parseFloat(board.querySelector('[data-metric="rate"]')?.textContent ?? '');
+      return Number.isFinite(position) && Number.isFinite(rate) && rate >= 90;
+    });
+  }, { timeout: 15000 });
+  const preflight = await page.evaluate(() => [...document.querySelectorAll('.board')].map(board => ({
+    port: board.dataset.port,
+    bus: Number.parseFloat(board.querySelector('[data-metric="bus"]')?.textContent ?? ''),
+    fault: board.querySelector('[data-metric="fault"]')?.textContent ?? '',
+  })));
+  if (!preflight.every(board => board.bus >= 6 && board.fault.startsWith('1'))) {
+    await page.locator('#stopAll').click();
+    await browser.close();
+    throw new Error('dual preflight failed: ' + JSON.stringify(preflight));
+  }
   await page.locator('[data-act="zero"]').nth(0).click();
   await page.locator('[data-act="zero"]').nth(1).click();
   await page.waitForTimeout(300);
@@ -44,7 +62,7 @@ const { chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-primary
   await fleetTarget(0);
   await page.waitForTimeout(4200);
   const atZero = await snapshot('zero');
-  await page.screenshot({ path: 'D:/AI_Workspace/apps/mini-bus-motor-debug-web/dual-closed-loop.png', fullPage: true });
+  await page.screenshot({ path: 'D:/AI_Workspace/apps/dual-esp32-motor-force-feedback/evidence/dual-closed-loop.png', fullPage: true });
   await page.locator('#stopAll').click();
   console.log(JSON.stringify({ at360, atZero, errors }, null, 2));
   const positions360 = at360.boards.map(board => Number.parseFloat(board.position));
@@ -56,5 +74,5 @@ const { chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-primary
     [...at360.boards, ...atZero.boards].every(board => board.fault.startsWith('1')) &&
     errors.length === 0;
   await browser.close();
-  if (!pass) process.exitCode = 1;
+  if (!pass) throw new Error('dual closed-loop acceptance failed');
 })();

@@ -354,14 +354,14 @@ def validate_command(command: str, _armed: bool = True):
     if cascade_velocity:
         values = [float(x) for x in cascade_velocity.groups() if x is not None]
         kp, ki, max_current = values[:3]
-        friction = values[3] if len(values) >= 4 else 2.0
-        current_slew = values[4] if len(values) >= 6 else 6.0
-        brake_slew = values[5] if len(values) >= 6 else 20.0
+        friction = values[3] if len(values) >= 4 else 2.2
+        current_slew = values[4] if len(values) >= 6 else 10.0
+        brake_slew = values[5] if len(values) >= 6 else 30.0
         if not all(math.isfinite(x) for x in values) or not (
-            0 <= kp <= 1 and 0 <= ki <= 1 and 0.05 <= max_current <= 4.5 and 0 <= friction <= 3
+            0 <= kp <= 1 and 0 <= ki <= 1 and 0.05 <= max_current <= 7 and 0 <= friction <= 5
             and 0.1 <= current_slew <= 100 and 1 <= brake_slew <= 50
         ):
-            raise ValueError("速度环范围：Kp/Ki 0..1，最大电流 0.05..4.5 A，摩擦前馈 0..3 A")
+            raise ValueError("速度环范围：Kp/Ki 0..1，最大电流 0.05..7 A，摩擦前馈 0..5 A")
         return f"cascade velocity {kp:g} {ki:g} {max_current:g} {friction:g} {current_slew:g} {brake_slew:g}"
     cascade_position = re.fullmatch(
         rf"cascade\s+position\s+{number}\s+{number}\s+{number}\s+{number}\s+{number}"
@@ -371,8 +371,8 @@ def validate_command(command: str, _armed: bool = True):
     if cascade_position:
         values = [float(x) for x in cascade_position.groups() if x is not None]
         kp, ki, kd, max_velocity, deadband = values[:5]
-        min_velocity = values[5] if len(values) >= 6 else 1200.0
-        acceleration = values[6] if len(values) >= 7 else 6000.0
+        min_velocity = values[5] if len(values) >= 6 else 2000.0
+        acceleration = values[6] if len(values) >= 7 else 20000.0
         reverse_kd = values[7] if len(values) >= 8 else 1.0
         if not all(math.isfinite(x) for x in values) or not (
             0 <= kp <= 1000 and 0 <= ki <= 1000 and 0 <= kd <= 100
@@ -406,8 +406,8 @@ def validate_command(command: str, _armed: bool = True):
     )
     if current:
         target = float(current.group(1)); duty = int(current.group(2)); timeout = int(current.group(3))
-        if not math.isfinite(target) or abs(target) > 4500 or not 12 <= duty <= 4095 or not 100 <= timeout <= 30000:
-            raise ValueError("current target must be -4500..4500 mA; duty 12..4095; timeout 100..30000 ms")
+        if not math.isfinite(target) or abs(target) > 7000 or not 12 <= duty <= 4095 or not 100 <= timeout <= 30000:
+            raise ValueError("current target must be -7000..7000 mA; hardware regulation is about 5 A; duty 12..4095; timeout 100..30000 ms")
         return f"current {target:g} {duty} {timeout}"
     velocity = re.fullmatch(
         r"velocity\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+(\d{1,4})\s+(\d{1,5})",

@@ -42,6 +42,8 @@ def main() -> int:
     parser.add_argument("--first", choices=("A", "B"), default="A")
     parser.add_argument("--gap-ms", type=float, default=0.0)
     parser.add_argument("--command", choices=("ping", "status"), default="ping")
+    parser.add_argument("--load-current-ma", type=float, default=0.0,
+                        help="run both local current loops during the transaction test")
     args = parser.parse_args()
 
     ports = {
@@ -65,6 +67,17 @@ def main() -> int:
                         raise RuntimeError(f"{name} baud mismatch: {line}")
         if len(addresses) != 2 or addresses["A"] == addresses["B"]:
             raise RuntimeError(f"invalid addresses: {addresses}")
+
+        if args.load_current_ma:
+            if abs(args.load_current_ma) > 500:
+                raise RuntimeError("diagnostic load current is limited to 500 mA")
+            for port in ports.values():
+                for command in (
+                    "wake", "setstep 3", "cascade current 400 1800 1200",
+                    f"current {args.load_current_ma:.1f} 1200 30000",
+                ):
+                    send(port, command)
+                    time.sleep(0.04)
 
         total_ok = 0
         total_timeout = 0
@@ -111,6 +124,7 @@ def main() -> int:
         for port in ports.values():
             try:
                 send(port, "stop")
+                send(port, "sleep")
             except Exception:
                 pass
             port.close()

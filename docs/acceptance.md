@@ -11,3 +11,8 @@ Each tagged iteration records the commands, firmware hash and CSV evidence used 
 7. DATA bus: 1 Mbaud, 8N1, CRC16; bidirectional ping/status and 200 Hz synchronized state exchange have measured timeout/error counts.
 8. Force feedback: both motors oppose relative displacement with bounded current, stable damping and link-loss shutdown.
 
+## Current acceptance status (2026-08-26)
+
+- Items 1–6: accepted on both motor-mounted boards over their independent USB ports.
+- Item 7: 1 Mbaud unloaded communication was previously accepted after the COM19 R9 repair; loaded synchronized exchange is deferred by user request.
+- Item 8: not accepted yet. Do not present force feedback as production-ready until the loaded DATA-link test is repeated.

@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>双板三环电机调试台</title>
-  <link rel="stylesheet" href="/dashboard.css?v=cascade-1">
-  <link rel="stylesheet" href="/dashboard-cascade.css?v=cascade-1">
+  <link rel="stylesheet" href="/dashboard.css?v=cascade-final-20260825">
+  <link rel="stylesheet" href="/dashboard-cascade.css?v=cascade-final-20260825">
 </head>
 <body>
   <header class="topbar">
@@ -28,10 +28,10 @@
     <label>电流上限 <output id="forceLimitOut">1000 mA</output><input id="forceLimit" type="range" min="100" max="4500" step="50" value="1000"></label>
     <button id="forceStart" class="primary">启动双向力反馈</button>
     <button id="forceStop" class="danger">停止力反馈</button>
-    <span id="forceState">等待两块板在线</span>
+    <span id="forceState">COM19 DATA 接收硬件暂缓；USB 三环调试不受影响</span>
   </section>
   <main id="boards"></main>
   <div id="toast"></div>
-  <script type="module" src="/dashboard.js?v=cascade-1"></script>
+  <script type="module" src="/dashboard.js?v=cascade-final-20260825"></script>
 </body>
 </html>

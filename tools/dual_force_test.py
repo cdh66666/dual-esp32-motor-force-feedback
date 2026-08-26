@@ -85,9 +85,9 @@ def main() -> int:
             port.reset_input_buffer()
             for command in (
                 "stop", "wake", "encreset", f"busbaud {args.baud}",
-                "cascade current 400 1800 1500",
-                "cascade velocity 0.0005 0.0002 3 2 6 20",
-                "cascade position 8 0 0.5 3000 3 1200 6000 1",
+                "cascade current 400 1800 4095",
+                "cascade velocity 0.0005 0.001 3 2 10 30",
+                "cascade position 8 0 0.5 3000 3 2000 20000 1",
                 f"stream {args.stream_rate}" if args.stream_rate else "stream off",
                 "businfo",
             ):
@@ -122,7 +122,7 @@ def main() -> int:
             signed_offset = args.offset if name == "A" else -args.offset
             send(
                 ports[name],
-                "sync force {} {} {} 0 {} 1500 30000 {}".format(
+                "sync force {} {} {} 0 {} 4095 30000 {}".format(
                     addresses[peer_name], args.stiffness, args.damping,
                     args.limit, signed_offset,
                 ),

@@ -136,6 +136,7 @@ def main() -> int:
     parser.add_argument("--count", type=int, default=1000)
     parser.add_argument("--rate", type=float, default=200.0)
     parser.add_argument("--baud", type=int, default=1_000_000)
+    parser.add_argument("--awake", action="store_true", help="wake both bridges but keep PWM at zero")
     args = parser.parse_args()
     if args.port_a == args.port_b or args.count <= 0 or args.rate <= 0:
         parser.error("ports must differ and count/rate must be positive")
@@ -149,7 +150,10 @@ def main() -> int:
         time.sleep(1.0)
         for name, port in ports.items():
             port.reset_input_buffer()
-            for command in ("sync stop", "stop", "sleep", "stream off", f"busbaud {args.baud}"):
+            for command in (
+                "sync stop", "stop", "wake" if args.awake else "sleep",
+                "stream off", f"busbaud {args.baud}",
+            ):
                 send(port, command)
                 time.sleep(0.03)
             line, _ = businfo(port, readers[name])

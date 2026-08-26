@@ -30,7 +30,7 @@ const { chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-primary
     scripts: document.scripts.length,
   }));
   await page.locator('#stopAll').click();
-  await page.screenshot({path: 'D:/AI_Workspace/apps/mini-bus-motor-debug-web/ui-smoke.png', fullPage: true});
+  await page.screenshot({path: 'D:/AI_Workspace/apps/dual-esp32-motor-force-feedback/evidence/ui-smoke.png', fullPage: true});
   console.log(JSON.stringify({...result, errors}, null, 2));
   await browser.close();
   const expectedBoards = focus ? 1 : 2;

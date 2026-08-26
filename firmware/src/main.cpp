@@ -4,7 +4,7 @@
 #include <Preferences.h>
 
 static constexpr const char *FW_NAME = "dual-esp32-motor-control";
-static constexpr const char *FW_VERSION = "0.3.20-proven-bus-production";
+static constexpr const char *FW_VERSION = "0.3.23-cascade-final";
 
 // ESP32-S3-WROOM-1-N16 mapping taken from the supplied schematic.
 static constexpr int PIN_ENBL = 4;       // SS6952T ENBL/IN1, PWM
@@ -200,10 +200,13 @@ static constexpr float POSITION_STALL_BOOST_MAX = 700.0f;
 static int8_t modelDirectionSign = 1;
 static float modelMaxVelocityDps = 60000.0f; // 10,000 rpm at the motor shaft
 static float modelMaxAccelerationDps2 = 60000.0f;
-// The schematic sets SS6952T full-scale current to about 5 A (1.245 V VREF,
-// 50 mOhm ISEN resistor, IFS=VREF/(5*Rsense)). Keep software below that board
-// limit and below the useful INA240A1/10 mOhm measurement range.
-static constexpr float BOARD_CURRENT_LIMIT_A = 4.5f;
+// The schematic sets SS6952T full-scale regulation to about 4.98 A
+// (3.3 V * 10k/(16.5k+10k) VREF, 50 mOhm ISEN,
+// IFS=VREF/(5*Rsense)). A command envelope up to 7 A is intentionally
+// accepted for bounded commissioning tests: the measured plateau verifies
+// the independent SS6952T chopper limit. Normal outer loops use their own
+// lower max-current setting and never rely on this diagnostic envelope.
+static constexpr float BOARD_CURRENT_LIMIT_A = 7.0f;
 static float modelCurrentLimitAmps = BOARD_CURRENT_LIMIT_A;
 static uint16_t modelMaxDuty = PWM_MAX;
 static uint32_t modelStopAtMs = 0;
@@ -225,17 +228,17 @@ static constexpr uint32_t POSITION_LOOP_PERIOD_US = 10000;// 100 Hz
 static float cascadeCurrentKp = 400.0f;      // PWM counts / A
 static float cascadeCurrentKi = 1800.0f;     // PWM counts / (A*s)
 static float cascadeVelocityKp = 0.0005f;    // A / (deg/s)
-static float cascadeVelocityKi = 0.0002f;    // A / deg
-static float cascadeVelocityFrictionA = 2.0f; // measured breakaway current only
+static float cascadeVelocityKi = 0.0010f;    // A / deg
+static float cascadeVelocityFrictionA = 2.2f; // measured breakaway-current ceiling
 static float cascadePositionKp = 8.0f;       // (deg/s) / deg
 static float cascadePositionKi = 0.0f;       // (deg/s) / (deg*s)
 static float cascadePositionKd = 0.5f;       // (deg/s) / (deg/s)
 static float cascadePositionReverseKdScale = 1.0f;
 static float cascadePositionMaxVelocityDps = 3000.0f;
-static float cascadePositionMinVelocityDps = 1200.0f;
+static float cascadePositionMinVelocityDps = 2000.0f;
 static float cascadePositionDeadbandDeg = 3.0f;
-static float cascadeVelocityMaxCurrentA = 3.0f;
-static float cascadeCurrentMaxPwm = 1500.0f;
+static float cascadeVelocityMaxCurrentA = 4.8f;
+static float cascadeCurrentMaxPwm = 4095.0f;
 static float cascadeVelocityRequestedDps = 0.0f;
 static float cascadeVelocityCommandDps = 0.0f;
 static float cascadeCurrentCommandA = 0.0f;
@@ -246,9 +249,9 @@ static float cascadeVelocityIntegral = 0.0f;
 static float cascadeCurrentIntegral = 0.0f;
 static float cascadeVelocityBreakawayA = 0.0f;
 static bool cascadeVelocityStictionActive = false;
-static float cascadeVelocityCurrentSlewAps = 6.0f;
-static float cascadeVelocityBrakeSlewMultiplier = 20.0f;
-static float cascadePositionMaxAccelerationDps2 = 6000.0f;
+static float cascadeVelocityCurrentSlewAps = 10.0f;
+static float cascadeVelocityBrakeSlewMultiplier = 30.0f;
+static float cascadePositionMaxAccelerationDps2 = 20000.0f;
 static float cascadeBusVoltage = 0.0f;
 static uint32_t cascadeLastCurrentUs = 0;
 static uint32_t cascadeLastVelocityUs = 0;
@@ -1270,6 +1273,10 @@ static void cascadeControlTick() {
       // every noisy zero-speed sample. A smaller running compensation avoids
       // the repeated forward/reverse bursts seen when 1.8 A was applied for
       // the entire move.
+      const bool lowSpeedVelocityRequest =
+          controlMode == CONTROL_VELOCITY &&
+          fabsf(modelTargetVelocityDps) > 1.0f &&
+          fabsf(modelTargetVelocityDps) < 1000.0f;
       if (fabsf(cascadeVelocityCommandDps) < 50.0f) {
         cascadeVelocityStictionActive = false;
       } else if (!cascadeVelocityStictionActive &&
@@ -1280,7 +1287,8 @@ static void cascadeControlTick() {
         cascadeVelocityStictionActive = false;
       }
       cascadeVelocityBreakawayA = cascadeVelocityStictionActive
-          ? cascadeVelocityFrictionA : 0.0f;
+          ? copysignf(cascadeVelocityFrictionA, cascadeVelocityCommandDps)
+          : 0.0f;
       // The configured friction current is only the measured breakaway kick.
       // Once moving, use the identified mechanical model instead of injecting
       // a constant 0.55 A forever. For alpha=(Kt/J)I-(B/J)omega, the current
@@ -1294,16 +1302,18 @@ static void cascadeControlTick() {
             -cascadeVelocityFrictionA, cascadeVelocityFrictionA);
       }
       const float velocityFeedForward = cascadeVelocityStictionActive
-          ? (cascadeVelocityCommandDps == 0.0f ? 0.0f :
-             copysignf(cascadeVelocityFrictionA,
-                       cascadeVelocityCommandDps))
-          : runningFeedForwardA;
+          ? cascadeVelocityBreakawayA : runningFeedForwardA;
       const float velocityIntegralLimit = cascadeVelocityKi > 0.0000001f
           ? cascadeVelocityMaxCurrentA / cascadeVelocityKi
           : 10000.0f;
-      const float candidateIntegral = constrain(
+      float candidateIntegral = constrain(
           cascadeVelocityIntegral + velocityError * velocityDt,
           -velocityIntegralLimit, velocityIntegralLimit);
+      const bool lowSpeedVelocityPulseMode = lowSpeedVelocityRequest;
+      if (lowSpeedVelocityPulseMode &&
+          candidateIntegral * modelTargetVelocityDps < 0.0f) {
+        candidateIntegral = 0.0f;
+      }
       const float candidateCurrent = cascadeVelocityKp * velocityError +
                                      cascadeVelocityKi * candidateIntegral +
                                      velocityFeedForward;
@@ -1324,14 +1334,24 @@ static void cascadeControlTick() {
       // Tracking anti-windup: do not store extra velocity error while the
       // torque command itself is still slewing toward the previous request.
       // Always permit opposite-sign error to unwind an existing integral.
-      if (!saturated && (!currentSlewLagging || integralUnwinding)) {
+      if (!saturated && (lowSpeedVelocityPulseMode ||
+                         !currentSlewLagging || integralUnwinding)) {
         cascadeVelocityIntegral = candidateIntegral;
       }
-      const float requestedCurrentA = constrain(
+      float requestedCurrentA = constrain(
           cascadeVelocityKp * velocityError +
               cascadeVelocityKi * cascadeVelocityIntegral +
               velocityFeedForward,
           -cascadeVelocityMaxCurrentA, cascadeVelocityMaxCurrentA);
+      // Below the motor's continuous breakaway speed, use one-direction
+      // pulse-density control: accelerate in the requested direction, then
+      // coast through magnetic detents. Active reverse braking here created a
+      // 0 -> 440 -> 0 deg/s limit cycle. Position mode retains full signed
+      // braking because its outer loop explicitly owns arrival and reversal.
+      if (lowSpeedVelocityPulseMode &&
+          requestedCurrentA * modelTargetVelocityDps < 0.0f) {
+        requestedCurrentA = 0.0f;
+      }
       // Limit torque-command slew. Current regulation still runs at 2 kHz;
       // this 200 Hz limiter only prevents the outer loop from commanding an
       // instantaneous multi-ampere reversal on a light rotor.
@@ -1392,10 +1412,19 @@ static void cascadeControlTick() {
   const bool saturated = (candidatePwm > pwmLimit && currentError > 0.0f) ||
                          (candidatePwm < -pwmLimit && currentError < 0.0f);
   if (!saturated) cascadeCurrentIntegral = candidateIntegral;
-  cascadeSignedPwm = constrain(
+  float requestedPwm =
       feedforwardPwm + cascadeCurrentKp * currentError +
-          cascadeCurrentKi * cascadeCurrentIntegral,
-      -pwmLimit, pwmLimit);
+          cascadeCurrentKi * cascadeCurrentIntegral;
+  // Do not reverse bridge voltage merely because measured current briefly
+  // exceeds a still-same-sign current target after magnetic breakaway. That
+  // active reverse pulse kicked the light rotor back into the previous detent.
+  // A real braking/reversal request arrives as an opposite-sign current target
+  // from the velocity loop and remains fully available.
+  if ((currentTarget > 0.005f && requestedPwm < 0.0f) ||
+      (currentTarget < -0.005f && requestedPwm > 0.0f)) {
+    requestedPwm = 0.0f;
+  }
+  cascadeSignedPwm = constrain(requestedPwm, -pwmLimit, pwmLimit);
   applyCascadeBridgePwm(cascadeSignedPwm);
   if (nowMs - lastPositionDebugMs >= 100) {
     lastPositionDebugMs = nowMs;
@@ -2318,11 +2347,11 @@ static void handleCommand(String cmd) {
           !isfinite(friction) || !isfinite(currentSlew) ||
           !isfinite(brakeSlewMultiplier) ||
           kp < 0.0f || kp > 1.0f || ki < 0.0f || ki > 1.0f ||
-          maxCurrent < 0.05f || maxCurrent > 3.0f ||
-          friction < 0.0f || friction > 3.0f ||
+          maxCurrent < 0.05f || maxCurrent > 7.0f ||
+          friction < 0.0f || friction > 5.0f ||
           currentSlew < 0.1f || currentSlew > 100.0f ||
           brakeSlewMultiplier < 1.0f || brakeSlewMultiplier > 50.0f) {
-        Console.println("ERR usage: cascade velocity KP(0..1) KI(0..1) MAX_CURRENT_A(0.05..3) [FRICTION_A(0..3)] [CURRENT_SLEW_A_PER_S(0.1..100)] [BRAKE_SLEW_MULTIPLIER(1..50)]");
+        Console.println("ERR usage: cascade velocity KP(0..1) KI(0..1) MAX_CURRENT_A(0.05..7) [FRICTION_A(0..5)] [CURRENT_SLEW_A_PER_S(0.1..100)] [BRAKE_SLEW_MULTIPLIER(1..50)]");
         return;
       }
       cascadeVelocityKp = kp; cascadeVelocityKi = ki;

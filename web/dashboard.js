@@ -15,7 +15,7 @@ const COLORS = {
 const CHARTS = {
   multi: { title: '多圈位置', color: COLORS.position, smooth: 0.45 },
   velocity: { title: '速度', color: COLORS.velocity, smooth: 0.18 },
-  current: { title: 'INA240 电机支路电流', color: COLORS.current, fixed: [-5, 5], smooth: 0.25 },
+  current: { title: 'INA240 电机支路电流', color: COLORS.current, fixed: [-5.2, 5.2], smooth: 0.25 },
   pwm: { title: '有符号 PWM', color: COLORS.pwm, fixed: [-4095, 4095], smooth: 0.35 },
   bus: { title: '母线电压', color: COLORS.bus, fixed: [0, 30], smooth: 0.12 }
 };
@@ -135,7 +135,7 @@ function boardHtml(board) {
     slider('positionKi', 'Ki', 0, 2, 0.005, 0),
     slider('positionKd', 'Kd', 0, 5, 0.01, 0.5),
     slider('positionMaxVelocity', '最大速度 °/s', 100, 6000, 10, 3000),
-    slider('positionMinVelocity', '脱困最小速度 °/s', 0, 2000, 10, 1200),
+    slider('positionMinVelocity', '脱困最小速度 °/s', 0, 2500, 10, 2000),
     slider('positionDeadband', '到位死区 °', 0.1, 10, 0.1, 3),
     '</div><div class="row"><button data-act="holdZero" class="primary">闭环保持 0°</button>',
     '<button data-act="positionTest">自动 360° 往返测试</button></div>',
@@ -146,18 +146,18 @@ function boardHtml(board) {
     slider('velocityTarget', '目标速度', -10000, 10000, 10, 0),
     '<div class="compact-sliders">',
     slider('velocityKp', 'Kp（A / (°/s)）', 0, 0.005, 0.00005, 0.0005),
-    slider('velocityKi', 'Ki', 0, 0.005, 0.00005, 0.0002),
-    slider('velocityMaxCurrent', '最大电流 A', 0.1, 4.5, 0.05, 3),
-    slider('velocityFriction', '静止脱困电流 A', 0, 3, 0.01, 2),
-    '</div><p class="hint">速度环输出电流目标；两块相同板使用同一组控制参数。</p></section></div>',
+    slider('velocityKi', 'Ki', 0, 0.005, 0.00005, 0.001),
+    slider('velocityMaxCurrent', '最大电流 A', 0.1, 7, 0.05, 4.8),
+    slider('velocityFriction', '静止脱困电流 A', 0, 5, 0.01, 2.2),
+    '</div><p class="hint">速度环输出电流目标；两块相同板使用同一组控制参数。低于约 1000°/s 时为克服磁槽的脉冲平均速度，位置保持不受此限制。</p></section></div>',
     '<div class="loop-block">', chart('current'),
     '<section class="loop-controls"><h3>① 电流环 · 2 kHz</h3>',
-    slider('currentTarget', '目标电流', -4500, 4500, 10, 0),
+    slider('currentTarget', '目标电流（诊断）', -7000, 7000, 10, 0),
     '<div class="compact-sliders">',
     slider('currentKp', 'Kp（PWM/A）', 0, 1500, 1, 400),
     slider('currentKi', 'Ki（PWM/(A·s)）', 0, 5000, 10, 1800),
-    slider('currentMaxPwm', '电流环最大 PWM', 1, 4095, 1, 1500),
-    '</div><p class="hint">这是电机支路/绕组电流，不等于电源平均输入电流。INA240A1 ×20、10 mΩ；SS6952T 板级内部限流约 5 A，软件最多 4.5 A。</p></section></div>',
+    slider('currentMaxPwm', '电流环最大 PWM', 1, 4095, 1, 4095),
+    '</div><p class="hint">这是电机支路/绕组电流，不等于电源平均输入电流。INA240A1 ×20、10 mΩ；VREF/50 mΩ 使实测电流在约 5 A 封顶，6–7 A 只用于短时验证硬件限流。</p></section></div>',
     '</div>',
     '<div class="secondary-charts">', chart('pwm'), chart('bus'), '</div>',
     '<section class="utility"><div class="row"><strong>开环点动</strong>',
@@ -256,7 +256,7 @@ function scheduleConfig(board) {
 function scheduleMotion(board, mode, value) {
   clearTimeout(board.timers[mode]);
   board.timers[mode] = setTimeout(() => {
-    if (board.active) runMotion(board, mode, value).catch(() => {});
+    if (board.active) runMotion(board, mode, value).catch(error => toast(error.message, true));
   }, mode === 'position' ? 75 : 110);
 }
 
@@ -266,11 +266,11 @@ async function applyCascade(board, notify = true) {
     valueOf(board, 'currentKi') + ' ' + valueOf(board, 'currentMaxPwm'));
   await send(board.port, 'cascade velocity ' + valueOf(board, 'velocityKp') + ' ' +
     valueOf(board, 'velocityKi') + ' ' + valueOf(board, 'velocityMaxCurrent') + ' ' +
-    valueOf(board, 'velocityFriction') + ' 6 20');
+    valueOf(board, 'velocityFriction') + ' 10 30');
   await send(board.port, 'cascade position ' + valueOf(board, 'positionKp') + ' ' +
     valueOf(board, 'positionKi') + ' ' + valueOf(board, 'positionKd') + ' ' +
     valueOf(board, 'positionMaxVelocity') + ' ' + valueOf(board, 'positionDeadband') + ' ' +
-    valueOf(board, 'positionMinVelocity') + ' 6000 1');
+    valueOf(board, 'positionMinVelocity') + ' 20000 1');
   board.configApplied = true;
   if (notify) toast(board.port + ': 三环参数已应用');
 }
@@ -285,6 +285,12 @@ async function ensureReady(board) {
 
 async function runMotion(board, mode, value) {
   if (!board.active) return;
+  if (!Number.isFinite(board.latest.bus) || board.latest.bus < 6) {
+    throw new Error(board.port + ': 电机母线仅 ' + fmt(board.latest.bus, 2) + ' V，欠压，未执行动作');
+  }
+  if (!board.latest.fault) {
+    throw new Error(board.port + ': nFAULT=0，未执行动作');
+  }
   await ensureReady(board);
   if (mode === 'position') await send(board.port, 'pos ' + value + ' 4095 30000');
   if (mode === 'velocity') await send(board.port, 'velocity ' + value + ' 4095 30000');
@@ -667,7 +673,8 @@ $('#stopAll').addEventListener('click', () => {
 
 $('#fleetSend').addEventListener('click', () => {
   const target = Number($('#fleetTarget').value);
-  Promise.all([...boards.values()].filter(board => board.active).map(board => runMotion(board, 'position', target))).catch(() => {});
+  Promise.all([...boards.values()].filter(board => board.active).map(board => runMotion(board, 'position', target)))
+    .catch(error => toast(error.message, true));
 });
 
 function updateForceOutputs() {
@@ -706,7 +713,7 @@ async function startForceFeedback() {
   for (const board of ordered) {
     const peer = pair.find(item => item !== board);
     await send(board.port, 'sync force ' + peer.busAddress + ' ' + stiffness + ' ' +
-      damping + ' 0 ' + limit + ' 1500 30000 0');
+      damping + ' 0 ' + limit + ' 4095 30000 0');
     await pause(80);
   }
   await pause(250);
