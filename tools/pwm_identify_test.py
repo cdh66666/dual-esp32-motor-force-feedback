@@ -11,7 +11,7 @@ FIELDS = [
     "pwm_abs", "nfault", "awake", "step", "encoder_raw", "velocity_dps",
     "control_mode", "legacy_target", "phase", "pwm_signed_legacy", "pid_raw",
     "pid_applied", "stall_boost", "settled", "velocity_target_dps",
-    "current_target_ma", "current_measured_ma", "cascade_pwm",
+    "current_target_ma", "current_measured_ma", "cascade_pwm", "raw_velocity_dps",
 ]
 
 
@@ -29,7 +29,7 @@ def read_rows(port: serial.Serial, duration_s: float, label: str) -> list[dict[s
         if not line.startswith(("S,", "T,")):
             continue
         values = line.split(",")[1:]
-        if len(values) != len(FIELDS):
+        if len(values) < len(FIELDS):
             continue
         row: dict[str, float | str] = {"label": label, "host_s": time.monotonic() - start}
         try:

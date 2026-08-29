@@ -19,7 +19,7 @@ FIELDS = [
     "control_mode", "legacy_target", "phase", "pwm_signed_legacy",
     "pid_raw", "pid_applied", "stall_boost", "settled",
     "velocity_target_dps", "current_target_ma", "current_measured_ma",
-    "cascade_pwm",
+    "cascade_pwm", "raw_velocity_dps",
 ]
 
 
@@ -70,6 +70,14 @@ def metrics(rows: list[dict[str, float | str]], target: float) -> dict[str, floa
     velocities = [float(r["velocity_dps"]) for r in rows]
     signed_velocities = [v * sign for v in velocities]
     times = [float(r["host_s"]) for r in rows]
+    command_index = next(
+        (
+            index for index, row in enumerate(rows)
+            if abs(float(row["velocity_target_dps"])) > 0.05
+        ),
+        0,
+    )
+    command_time = times[command_index]
     intervals = [(times[i] - times[i - 1]) * 1000.0 for i in range(1, len(times))]
     tail = signed_velocities[max(0, len(rows) - max(5, int(len(rows) * 0.25))):]
     errors = [abs(target - v) for v in velocities]
@@ -82,21 +90,25 @@ def metrics(rows: list[dict[str, float | str]], target: float) -> dict[str, floa
         1 for i in range(1, len(pwm))
         if abs(pwm[i - 1]) > 10 and abs(pwm[i]) > 10 and pwm[i - 1] * pwm[i] < 0
     )
-    reach10 = next((times[i] for i, v in enumerate(signed_velocities) if v >= abs(target) * 0.1), math.nan)
-    reach90 = next((times[i] for i, v in enumerate(signed_velocities) if v >= abs(target) * 0.9), math.nan)
+    reach10_capture = next((times[i] for i, v in enumerate(signed_velocities) if v >= abs(target) * 0.1), math.nan)
+    reach90_capture = next((times[i] for i, v in enumerate(signed_velocities) if v >= abs(target) * 0.9), math.nan)
+    reach10 = max(0.0, reach10_capture - command_time) if math.isfinite(reach10_capture) else math.nan
+    reach90 = max(0.0, reach90_capture - command_time) if math.isfinite(reach90_capture) else math.nan
     settle_s = math.nan
     band = max(50.0, abs(target) * 0.10)
     for i in range(len(rows)):
         if all(abs(target - velocities[j]) <= band for j in range(i, len(rows))):
-            settle_s = times[i]
+            settle_s = max(0.0, times[i] - command_time)
             break
     return {
         "samples": len(rows),
         "sample_hz": 1000.0 / statistics.mean(intervals),
         "interval_p95_ms": percentile(intervals, 0.95),
+        "command_seen_s": command_time,
         "start_velocity_dps": velocities[0],
         "rise10_s": reach10,
         "rise90_s": reach90,
+        "capture_rise90_s": reach90_capture,
         "settle10_s": settle_s,
         "peak_signed_velocity_dps": max(signed_velocities),
         "overshoot_pct": max(0.0, (max(signed_velocities) - abs(target)) / abs(target) * 100.0),
@@ -112,6 +124,56 @@ def metrics(rows: list[dict[str, float | str]], target: float) -> dict[str, floa
     }
 
 
+def retarget_metrics(
+    before: list[dict[str, float | str]],
+    after: list[dict[str, float | str]],
+    start: float,
+    target: float,
+) -> dict[str, float | int]:
+    """Score a same-direction retarget without hiding a transient STOP."""
+    if len(before) < 5 or len(after) < 5:
+        return {"samples": len(after)}
+    tail_count = min(30, len(before))
+    pre_velocity = statistics.mean(
+        float(row["velocity_dps"]) for row in before[-tail_count:]
+    )
+    times = [float(row["host_s"]) for row in after]
+    velocities = [float(row["velocity_dps"]) for row in after]
+    first_window = [
+        abs(velocity) for sample_time, velocity in zip(times, velocities)
+        if sample_time <= 0.25
+    ]
+    transition = target - start
+    threshold = start + 0.9 * transition
+    if transition >= 0:
+        reach90 = next(
+            (times[i] for i, velocity in enumerate(velocities) if velocity >= threshold),
+            math.nan,
+        )
+    else:
+        reach90 = next(
+            (times[i] for i, velocity in enumerate(velocities) if velocity <= threshold),
+            math.nan,
+        )
+    reference_floor = max(1.0, min(abs(start), abs(target)))
+    minimum_abs_velocity = min(first_window) if first_window else math.nan
+    return {
+        "samples": len(after),
+        "pre_velocity_dps": pre_velocity,
+        "transition90_s": reach90,
+        "minimum_abs_velocity_first_250ms": minimum_abs_velocity,
+        "zero_dip_ratio": minimum_abs_velocity / reference_floor,
+        "tail_velocity_dps": statistics.mean(velocities[-min(30, len(velocities)):]),
+        "peak_current_target_ma": max(
+            abs(float(row["current_target_ma"])) for row in after
+        ),
+        "peak_current_measured_ma": max(
+            abs(float(row["current_measured_ma"])) for row in after
+        ),
+        "nfault_min": int(min(float(row["nfault"]) for row in after)),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", required=True, help="Freshly enumerated USB CDC port")
@@ -124,10 +186,19 @@ def main() -> int:
     parser.add_argument("--current-kp", type=float, default=400.0)
     parser.add_argument("--current-ki", type=float, default=1800.0)
     parser.add_argument("--current-max-pwm", type=float, default=4095.0)
-    parser.add_argument("--current-slew", type=float, default=10.0)
+    parser.add_argument("--current-slew", type=float, default=30.0)
     parser.add_argument("--brake-slew", type=float, default=30.0)
     parser.add_argument("--drive", choices=("sign", "locked"), default="sign")
+    parser.add_argument(
+        "--retarget-check", action="store_true",
+        help="Also test same-direction speed changes without an intervening STOP",
+    )
+    parser.add_argument("--retarget-start", type=float, default=1000.0)
+    parser.add_argument("--retarget-end", type=float, default=3000.0)
+    parser.add_argument("--retarget-settle", type=float, default=1.5)
     args = parser.parse_args()
+    if args.retarget_start * args.retarget_end <= 0:
+        parser.error("retarget start/end must be non-zero and have the same sign")
 
     output_dir = Path(__file__).resolve().parent / "captures"
     output_dir.mkdir(exist_ok=True)
@@ -164,6 +235,37 @@ def main() -> int:
                     print(f"  {key}={value:.3f}")
                 else:
                     print(f"  {key}={value}")
+
+        if args.retarget_check:
+            send(port, "stop")
+            time.sleep(0.35)
+            send(port, "wake")
+            time.sleep(0.08)
+            start = args.retarget_start
+            end = args.retarget_end
+            timeout_ms = int((args.retarget_settle + args.duration * 2.0 + 2.0) * 1000)
+            send(port, f"velocity {start:.3f} {int(args.current_max_pwm)} {timeout_ms}")
+            before = read_rows(
+                port, args.retarget_settle, f"retarget_hold_{start:+.0f}"
+            )
+            all_rows.extend(before)
+
+            # These two commands intentionally have no STOP between them.
+            send(port, f"velocity {end:.3f} {int(args.current_max_pwm)} {timeout_ms}")
+            upward = read_rows(port, args.duration, f"retarget_{start:+.0f}_to_{end:+.0f}")
+            all_rows.extend(upward)
+            print(f"RETARGET {start:+.0f} -> {end:+.0f} dps (no STOP)")
+            for key, value in retarget_metrics(before, upward, start, end).items():
+                print(f"  {key}={value:.3f}" if isinstance(value, float) else f"  {key}={value}")
+
+            send(port, f"velocity {start:.3f} {int(args.current_max_pwm)} {timeout_ms}")
+            downward = read_rows(port, args.duration, f"retarget_{end:+.0f}_to_{start:+.0f}")
+            all_rows.extend(downward)
+            print(f"RETARGET {end:+.0f} -> {start:+.0f} dps (no STOP)")
+            for key, value in retarget_metrics(upward, downward, end, start).items():
+                print(f"  {key}={value:.3f}" if isinstance(value, float) else f"  {key}={value}")
+            send(port, "stop")
+            time.sleep(0.35)
 
         send(port, "stop")
         send(port, "stream off")

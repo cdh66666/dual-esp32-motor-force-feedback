@@ -22,13 +22,30 @@ def score(rows: list[dict[str, float | str]], target_ma: float) -> dict[str, flo
     times = [float(row["host_s"]) for row in rows]
     direction = 1.0 if target_ma >= 0 else -1.0
     signed = [value * direction for value in measured]
+    command_index = next(
+        (
+            index for index, row in enumerate(rows)
+            if abs(float(row["current_target_ma"])) >= abs(target_ma) * 0.9
+        ),
+        0,
+    )
+    command_time = times[command_index]
     tail = signed[-max(10, int(len(rows) * 0.3)):]
-    rise90 = next((times[i] for i, value in enumerate(signed) if value >= abs(target_ma) * 0.9), math.nan)
+    rise90_capture = next(
+        (times[i] for i, value in enumerate(signed) if value >= abs(target_ma) * 0.9),
+        math.nan,
+    )
+    rise90 = (
+        max(0.0, rise90_capture - command_time)
+        if math.isfinite(rise90_capture) else math.nan
+    )
     pwm = [float(row["cascade_pwm"]) for row in rows]
     return {
         "samples": len(rows),
         "sample_hz": (len(times) - 1) / (times[-1] - times[0]),
+        "command_seen_s": command_time,
         "rise90_s": rise90,
+        "capture_rise90_s": rise90_capture,
         "tail_mean_ma": statistics.mean(tail) * direction,
         "tail_error_ma": abs(statistics.mean(tail) - abs(target_ma)),
         "tail_span_ma": max(tail) - min(tail),

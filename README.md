@@ -2,7 +2,7 @@
 
 同一套 ESP32-S3 固件驱动两块相同电路板，提供：
 
-- 2 kHz 电流环、200 Hz 速度环、100 Hz 位置环；
+- 2 kHz 电流环、200 Hz 速度环、200 Hz 位置环；
 - MT6701 多圈位置、INA240A1 电机支路电流和母线电压遥测；
 - 1 Mbaud、8N1、CRC16 的地址化单线 DATA 总线；
 - 双板位置同步与双向虚拟弹簧/阻尼力反馈框架；
@@ -27,14 +27,37 @@
 - `docs/`：硬件关系、协议和验收指标；
 - `evidence/`：脱敏后的版本测试结果。
 
-## 本地运行
+## 换电脑直接运行
+
+Windows 11 安装 Git、Python 3 和 PowerShell 7 后，在 PowerShell 7 执行：
 
 ```powershell
+git clone https://github.com/cdh66666/dual-esp32-motor-force-feedback.git
+cd dual-esp32-motor-force-feedback
+python .\tools\launch_dashboard.py
+```
+
+脚本会安装 `pyserial`、启动本机网页服务并打开 `http://127.0.0.1:8766/`。网页实时枚举当前电脑的 ESP32 USB 串口，不依赖 COM18/COM19 这些历史端口号。给另一台电脑上的 Codex 仓库链接和一句“按 README 启动调试台”即可复现界面；实际控制前仍须确认新电脑识别到板卡并且板上固件版本一致。
+
+## 编译与烧录
+
+```powershell
+python -m pip install platformio
 cd firmware
 pio run
+pio run -t upload --upload-port COMx
 
 cd ..\web
+python -m pip install -r ..\requirements.txt
 python server.py
 ```
 
 浏览器打开 `http://127.0.0.1:8766/`。固件烧录前必须重新枚举 USB 身份，不能只相信历史 COM 号。
+
+## 限时诊断与复位
+
+- 电流目标每次拖动默认只保持 1.0 秒，范围 0.1–10 秒，到时由固件停止；
+- 速度目标每次拖动默认只保持 3.0 秒，范围 0.1–30 秒，到时由固件停止；
+- 电流和速度诊断不自动续租，位置保持仍按安全看门狗续租；
+- `全部 STOP` 会停止并重新准备驱动；旁边的 `复位全部` 会对所有在线板执行 STOP、功率通路恢复和状态读取，不会恢复旧目标；
+- 显示单位默认使用圈和 rps，可切换为角度和 °/s。

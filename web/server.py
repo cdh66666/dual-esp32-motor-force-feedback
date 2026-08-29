@@ -29,14 +29,19 @@ class PortSession:
         self.thread = None
         self.lock = threading.Lock()
         self.write_lock = threading.Lock()
+        self.lifecycle_lock = threading.Lock()
         self.monitor_thread = None
         self.monitor_stop = threading.Event()
         self.seq = 0
         self.logs = deque(maxlen=300)
         self.write_ok = False
         self.last_error = ""
+        self.connected_at = 0.0
+        self.last_rx_at = 0.0
+        self.reader_alive = False
 
     def add_log(self, direction: str, text: str):
+        fault_snapshot = None
         with self.lock:
             self.seq += 1
             self.logs.append({
@@ -45,73 +50,137 @@ class PortSession:
                 "direction": direction,
                 "text": text,
             })
+            if direction == "rx" and re.match(
+                r"^(?:CASCADE (?:no_current_response|no_power_response|fault|bus_low|timeout)|ERR )",
+                text,
+            ):
+                fault_snapshot = list(self.logs)
+        if fault_snapshot:
+            threading.Thread(
+                target=self._write_fault_capture,
+                args=(fault_snapshot, text),
+                daemon=True,
+            ).start()
+
+    def _write_fault_capture(self, entries, reason: str):
+        try:
+            folder = ROOT.parent / "evidence" / "fault-captures"
+            folder.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            path = folder / f"{stamp}-{self.port}.jsonl"
+            header = {
+                "capture": "motor-controller-fault",
+                "port": self.port,
+                "reason": reason,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }
+            lines = [json.dumps(header, ensure_ascii=False)]
+            lines.extend(json.dumps(entry, ensure_ascii=False) for entry in entries)
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.add_log("system", f"fault capture saved: {path.name}")
+        except Exception as exc:
+            self.add_log("error", f"fault capture failed: {exc}")
 
     def connect(self):
-        if self.ser and self.ser.is_open:
-            return
-        ser = serial.Serial()
-        ser.port = self.port
-        ser.baudrate = 115200
-        ser.bytesize = serial.EIGHTBITS
-        ser.parity = serial.PARITY_NONE
-        ser.stopbits = serial.STOPBITS_ONE
-        ser.timeout = 0.05
-        ser.write_timeout = 0.5
-        ser.rtscts = False
-        ser.dsrdtr = False
-        ser.dtr = False
-        ser.rts = False
-        ser.open()
-        self.ser = ser
-        self.write_ok = True
-        self.last_error = ""
-        self.stop_event.clear()
-        self.monitor_stop.clear()
-        self.thread = threading.Thread(target=self._reader, daemon=True)
-        self.thread.start()
-        self.monitor_thread = threading.Thread(target=self._monitor, daemon=True)
-        self.monitor_thread.start()
-        self.add_log("system", "connected")
+        with self.lifecycle_lock:
+            if self.ser and self.ser.is_open and self.reader_alive:
+                return
+            if self.ser:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+            ser = serial.Serial()
+            ser.port = self.port
+            ser.baudrate = 115200
+            ser.bytesize = serial.EIGHTBITS
+            ser.parity = serial.PARITY_NONE
+            ser.stopbits = serial.STOPBITS_ONE
+            ser.timeout = 0.05
+            ser.write_timeout = 0.5
+            ser.rtscts = False
+            ser.dsrdtr = False
+            # TinyUSB CDC follows the USB CDC contract and suppresses output
+            # until the host asserts DTR. Keep RTS low so this is never the
+            # ESP32 DTR/RTS download-reset combination. Hardware HWCDC boards
+            # also tolerate DTR asserted with RTS low.
+            ser.dtr = True
+            ser.rts = False
+            ser.open()
+            # Events are per connection. Reusing and clearing the previous
+            # Event could revive an old reader/monitor thread after reconnect,
+            # leaving two threads competing for the new CDC stream.
+            stop_event = threading.Event()
+            monitor_stop = threading.Event()
+            self.stop_event = stop_event
+            self.monitor_stop = monitor_stop
+            self.ser = ser
+            self.write_ok = True
+            self.last_error = ""
+            self.connected_at = time.monotonic()
+            self.last_rx_at = 0.0
+            self.thread = threading.Thread(
+                target=self._reader, args=(ser, stop_event), daemon=True
+            )
+            self.thread.start()
+            self.monitor_thread = threading.Thread(
+                target=self._monitor, args=(ser, monitor_stop), daemon=True
+            )
+            self.monitor_thread.start()
+            self.add_log("system", "connected")
 
     def disconnect(self):
-        self.stop_event.set()
-        self.monitor_stop.set()
-        ser = self.ser
-        self.ser = None
-        if ser:
-            try:
-                ser.close()
-            except Exception:
-                pass
+        with self.lifecycle_lock:
+            self.stop_event.set()
+            self.monitor_stop.set()
+            ser = self.ser
+            self.ser = None
+            self.write_ok = False
+            self.reader_alive = False
+            # Close before allowing a new connect() to open the same Windows
+            # COM device; otherwise rapid reconnect can race the old handle.
+            if ser:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
         self.add_log("system", "disconnected")
 
-    def _reader(self):
+    def _reader(self, ser, stop_event):
         pending = bytearray()
-        while not self.stop_event.is_set():
-            ser = self.ser
-            if not ser or not ser.is_open:
-                break
-            try:
-                data = ser.read(256)
-            except Exception as exc:
-                self.add_log("error", f"read: {exc}")
-                break
-            if not data:
-                continue
-            pending.extend(data)
-            while b"\n" in pending:
-                raw, _, pending = pending.partition(b"\n")
-                text = raw.rstrip(b"\r").decode("utf-8", errors="replace")
-                self.add_log("rx", text)
-        if self.ser is ser:
-            self.add_log("system", "reader stopped")
+        self.reader_alive = True
+        try:
+            while not stop_event.is_set():
+                if not ser.is_open:
+                    break
+                try:
+                    data = ser.read(256)
+                except Exception as exc:
+                    self.last_error = f"read: {exc}"
+                    self.write_ok = False
+                    self.add_log("error", self.last_error)
+                    break
+                if not data:
+                    continue
+                self.last_rx_at = time.monotonic()
+                pending.extend(data)
+                while b"\n" in pending:
+                    raw, _, pending = pending.partition(b"\n")
+                    text = raw.rstrip(b"\r").decode("utf-8", errors="replace")
+                    self.add_log("rx", text)
+        finally:
+            if self.ser is ser:
+                self.reader_alive = False
+                self.add_log("system", "reader stopped")
 
-    def send(self, command: str):
+    def send(self, command: str, expected_ser=None):
         line = command.strip()
         with self.write_lock:
             ser = self.ser
             if not ser or not ser.is_open:
                 raise RuntimeError("port is not connected")
+            if expected_ser is not None and ser is not expected_ser:
+                raise RuntimeError("serial connection was replaced")
             try:
                 ser.write((line + "\r\n").encode("utf-8"))
                 self.write_ok = True
@@ -123,28 +192,31 @@ class PortSession:
                 self.add_log("error", f"write: {exc}")
                 raise
 
-    def _monitor(self):
+    def _monitor(self, ser, monitor_stop):
         # The firmware emits compact SAMPLE frames at 100 Hz over native USB CDC.
         # Keep a slow status request as a compatibility fallback for older builds.
         # Native USB CDC can enumerate before its OUT endpoint is ready after
         # a reset. Give it a deterministic settling window so automatic page
         # reconnects do not race the device firmware.
-        if self.monitor_stop.wait(1.0):
+        if monitor_stop.wait(1.0):
             return
         try:
-            if self.ser and self.ser.is_open:
-                self.send("stream 100")
-                # Wake the driver with PWM=0 so the page is immediately usable.
-                # STOP remains available at all times; there is no UI ARM gate.
-                self.send("wake")
-                self.send("businfo")
-                self.send("model")
+            if self.ser is ser and ser.is_open:
+                self.send("stream 100", expected_ser=ser)
+                # Monitoring must never change actuator state. A delayed
+                # unconditional WAKE used to reset the controller one second
+                # after connection and cancel a command sent meanwhile. The UI
+                # performs readiness immediately before the first motion.
+                self.send("businfo", expected_ser=ser)
+                self.send("model", expected_ser=ser)
         except Exception as exc:
             self.add_log("error", f"stream start: {exc}")
-        while not self.monitor_stop.wait(1.0):
+        while not monitor_stop.wait(1.0):
             try:
-                if self.ser and self.ser.is_open:
-                    self.send("status")
+                if self.ser is ser and ser.is_open:
+                    self.send("status", expected_ser=ser)
+                else:
+                    break
             except Exception as exc:
                 self.add_log("error", f"monitor: {exc}")
                 break
@@ -191,6 +263,11 @@ def port_info():
     for item in list_ports.comports():
         if not item.device:
             continue
+        session = sessions.get(item.device)
+        now = time.monotonic()
+        connected_age_ms = int(max(0.0, now - session.connected_at) * 1000) if session and session.connected_at else None
+        rx_age_ms = int(max(0.0, now - session.last_rx_at) * 1000) if session and session.last_rx_at else None
+        telemetry_ok = bool(session and session.reader_alive and rx_age_ms is not None and rx_age_ms < 2500)
         result.append({
             "port": item.device,
             "description": item.description,
@@ -198,7 +275,14 @@ def port_info():
             "active": bool(sessions.get(item.device) and sessions[item.device].ser and sessions[item.device].ser.is_open),
             "write_ok": bool(sessions.get(item.device) and sessions[item.device].write_ok),
             "last_error": sessions[item.device].last_error if sessions.get(item.device) else "",
-            "esp32": "303A:1001" in (item.hwid or "").upper(),
+            "reader_alive": bool(session and session.reader_alive),
+            "connected_age_ms": connected_age_ms,
+            "rx_age_ms": rx_age_ms,
+            "telemetry_ok": telemetry_ok,
+            # Hardware USB-Serial/JTAG is PID 1001; TinyUSB CDC defaults to
+            # PID 0002. Both are the same ESP32-S3 boards and must appear in
+            # the live dashboard.
+            "esp32": "VID:PID=303A:" in (item.hwid or "").upper(),
             "present": True,
         })
     return sorted(result, key=lambda x: x["port"])
@@ -243,7 +327,7 @@ def usb_problem_devices():
 
 def validate_command(command: str, _armed: bool = True):
     command = command.strip()
-    safe = {"help", "status", "diag", "encoder", "encreset", "rawadc", "model", "businfo", "wake", "sleep", "stop", "led on", "led off", "decay slow", "decay fast", "pospid on", "pospid off", "pospid status", "cascade status", "sync off", "sync stop", "sync disarm", "sync status"}
+    safe = {"help", "status", "diag", "encoder", "encreset", "rawadc", "model", "businfo", "wake", "recover", "sleep", "stop", "led on", "led off", "decay slow", "decay fast", "pospid on", "pospid off", "pospid status", "cascade status", "sync off", "sync stop", "sync disarm", "sync status"}
     if command in safe:
         return command
     if command == "sync arm":
@@ -347,6 +431,14 @@ def validate_command(command: str, _armed: bool = True):
         ):
             raise ValueError("电流环范围：Kp 0..5000，Ki 0..100000，最大 PWM 1..4095")
         return f"cascade current {kp:g} {ki:g} {max_pwm:g}"
+    cascade_low_speed_current = re.fullmatch(
+        rf"cascade\s+low_speed_current\s+{number}", command
+    )
+    if cascade_low_speed_current:
+        current = float(cascade_low_speed_current.group(1))
+        if not math.isfinite(current) or not 0 <= current <= 7:
+            raise ValueError("低速电流下限范围：0..7 A；位置环接近目标或刹车时不会强制恒流")
+        return f"cascade low_speed_current {current:g}"
     cascade_velocity = re.fullmatch(
         rf"cascade\s+velocity\s+{number}\s+{number}\s+{number}"
         rf"(?:\s+{number}(?:\s+{number}\s+{number})?)?", command
@@ -355,7 +447,7 @@ def validate_command(command: str, _armed: bool = True):
         values = [float(x) for x in cascade_velocity.groups() if x is not None]
         kp, ki, max_current = values[:3]
         friction = values[3] if len(values) >= 4 else 2.2
-        current_slew = values[4] if len(values) >= 6 else 10.0
+        current_slew = values[4] if len(values) >= 6 else 30.0
         brake_slew = values[5] if len(values) >= 6 else 30.0
         if not all(math.isfinite(x) for x in values) or not (
             0 <= kp <= 1 and 0 <= ki <= 1 and 0.05 <= max_current <= 7 and 0 <= friction <= 5
