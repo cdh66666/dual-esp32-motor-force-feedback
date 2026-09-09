@@ -1,0 +1,13 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),path=require('node:path');
+const source=fs.readFileSync(path.join(__dirname,'../web/dashboard.js'),'utf8'),ctx=vm.createContext({});
+vm.runInContext(source.slice(source.indexOf('function fitControlRows('),source.indexOf('function movingElectricalRows(')),ctx);
+const rows=Array.from({length:12},(_,group)=>Array.from({length:3},(_,i)=>({group,x:[group+i*.3+1,1],y:2*(group+i*.3+1)+3}))).flat();
+const fit=ctx.fitControlRows(rows,'test');
+assert.deepEqual(Array.from(fit.heldOutGroups),[10,11]);
+assert.equal(fit.validationSamples,6); assert.equal(fit.trainingSamples,30);
+assert(Math.abs(fit.coefficients[0]-2)<1e-9);
+const corrupted=rows.map(r=>({...r,y:r.y+(r.group>=10?100:0)}));
+assert.throws(()=>ctx.fitControlRows(corrupted,'test'),/超过 25%/);
+assert(source.includes('Math.max(100,duration)'), 'current command must respect firmware minimum lease');
+assert(source.indexOf('report.rejectedPulse={ma,bus,error:error.message')<source.indexOf("const meta=(await tx(b,'trace dump')).reply",source.indexOf('const pulseStart=')), 'preserve original motion failure before trace dump can fail');
+console.log('PASS: whole-pulse holdout, unchanged residual threshold, firmware lease and failure-record contracts');

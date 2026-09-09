@@ -1,0 +1,15 @@
+const assert=require('node:assert/strict');
+const vm=require('node:vm');
+const fs=require('node:fs');
+const source=fs.readFileSync(require('node:path').join(__dirname,'../web/dashboard.js'),'utf8');
+const ctx=vm.createContext({});
+vm.runInContext(source.slice(source.indexOf('function positionTrialMetrics('),source.indexOf('async function runAutoTune(')),ctx);
+const make=(fn)=>Array.from({length:160},(_,i)=>({t:i*10,multi:fn(i*10)}));
+const fast=make(t=>5*(1-Math.exp(-t/100)));
+assert(ctx.positionTrialMetrics(fast,0,5).passed);
+assert(ctx.positionTrialMetrics(fast.map(s=>({...s,multi:-s.multi})),0,-5).passed);
+const overshoot=make(t=>t<600 ? 5.4*(1-Math.exp(-t/80)) : 5);
+assert(!ctx.positionTrialMetrics(overshoot,0,5).passed);
+assert(!ctx.positionTrialMetrics(make(()=>4.8),0,5).passed);
+assert.throws(()=>ctx.positionTrialMetrics(fast.slice(0,10),0,5),/遥测不足/);
+console.log('PASS: bidirectional tolerance, overshoot rejection, steady error, insufficient evidence');

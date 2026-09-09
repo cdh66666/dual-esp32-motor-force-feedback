@@ -2,13 +2,37 @@
 #include <HardwareSerial.h>
 #include <Wire.h>
 #include <Preferences.h>
+#include "control_math.h"
+#include "haptic_knob.h"
+#include "interaction_guard.h"
+#include "usb_tx_policy.h"
+#include "usb_console.h"
+#include "usb_dcd_guard.h"
+#include "driver/adc.h"
+#include "driver/ledc.h"
+#include "esp_adc_cal.h"
+#include "esp_task_wdt.h"
+#include "esp_timer.h"
+
+#if ARDUINO_USB_CDC_ON_BOOT && !ARDUINO_USB_MODE
+#include "tusb.h"
+#endif
 
 #if defined(TINYUSB_RECOVERY_BUILD) && ARDUINO_USB_MODE != 0
 #error "TinyUSB recovery build did not override ARDUINO_USB_MODE"
 #endif
 
 static constexpr const char *FW_NAME = "dual-esp32-motor-control";
-static constexpr const char *FW_VERSION = "0.4.8-latched-powerpath-recovery";
+static constexpr const char *FW_VERSION = "0.5.9-sync-trace";
+static bool loopWatchdogReady = false;
+static uint32_t encoderReadCount = 0, encoderNacks = 0, encoderShortReads = 0;
+static uint32_t encoderRejectedJumps = 0, encoderReadMaxUs = 0;
+static uint32_t encoderNextReadUs = 0, loopMaxGapUs = 0, loopPreviousUs = 0;
+static uint32_t usbLastCommandMs = 0, telemetryDroppedFrames = 0;
+static uint32_t usbObservedDisconnects = 0, usbRejectedCommands = 0;
+RTC_NOINIT_ATTR static usb_link::Recovery usbRecovery;
+static bool bootWasUsbRecovery = false;
+static constexpr uint32_t ENCODER_PERIOD_US = 1000;
 
 // ESP32-S3-WROOM-1-N16 mapping taken from the supplied schematic.
 static constexpr int PIN_ENBL = 4;       // SS6952T ENBL/IN1, PWM
@@ -20,6 +44,7 @@ static constexpr int PIN_I1 = 10;
 static constexpr int PIN_SDA = 11;       // MT6701 A/SDA
 static constexpr int PIN_SCL = 12;       // MT6701 B/SCL
 static constexpr int PIN_DECAY = 15;     // SS6952T DECAY
+static bool runningDecayFast = false;
 static constexpr int PIN_NFAULT = 18;    // SS6952T nFAULT, active low
 static constexpr int PIN_LED = 21;
 static constexpr int PIN_CURRENT_ADC = 1; // ADC1 / INA240 output
@@ -27,25 +52,57 @@ static constexpr int PIN_VBAT_ADC = 2;    // ADC1 / 56k:5.1k divider
 static constexpr int PIN_BUS_TX = 41;
 static constexpr int PIN_BUS_RX = 42;
 
-// Keep the public controller scale at 0..4095 while using a 10-bit hardware
-// timer at 20 kHz. This keeps the carrier outside the audible band without
-// changing any current-loop gains or host-side command ranges.
-static constexpr uint32_t PWM_HZ = 20000;
+// 80 MHz / 4096 = 19531.25 Hz: real 12-bit resolution, not a 12-bit UI
+// rescaled to a 10-bit timer. Diagnostics report the actual carrier frequency.
+static constexpr uint32_t PWM_HZ = 19531;
 static constexpr uint32_t PWM_FALLBACK_HZ = 16000;
-static constexpr uint8_t PWM_BITS = 10;
+static constexpr uint8_t PWM_BITS = 12;
 static constexpr uint8_t PWM_CH = 0;
 static constexpr uint16_t PWM_TIMER_MAX = (1u << PWM_BITS) - 1;
 static constexpr uint16_t PWM_MAX = 4095;
+// SS6952T is not a 6 V motor-supply driver. The motor profile's rated
+// voltage is the armature voltage shaped with PWM; VM is the driver's
+// separate supply rail and must stay in its 8..50 V operating range.
+static constexpr float SS6952T_VM_MIN_V = 8.0f;
+static constexpr float SS6952T_VM_MAX_V = 50.0f;
+
+enum MotorProfileId : uint8_t {
+  MOTOR_PROFILE_775 = 0,
+  MOTOR_PROFILE_25GA370_6V_620RPM = 1,
+  MOTOR_PROFILE_36GP555_24V_1538RPM = 2,
+};
+
+// The selected profile is commissioning data, shared by the firmware and UI.
+// Unknown catalogue values (notably stall current) are deliberately not
+// invented: the 25GA-370 starts with a conservative current envelope and can
+// then be refined by the existing bounded identification routine.
+static MotorProfileId activeMotorProfile = MOTOR_PROFILE_775;
+static float motorProfileRatedVoltage = 24.0f;
+static float motorProfileRatedSpeedDps = 60000.0f;
+static float motorProfileCurrentLimitA = 7.0f;
+static float motorProfileGearRatio = 1.0f;
+static float motorProfileOutputSpeedRpm = 0.0f;
+static constexpr int ROTOR_HARMONICS = 18;
+struct RotorCompensation {
+  uint32_t version = 1;
+  float scale = 0.0f, coulombA = 0.0f, offsetA = 0.0f;
+  float harmonic[ROTOR_HARMONICS][2] = {};
+};
+static RotorCompensation rotorComp;
+static float rotorTable[360] = {};
+static void loadRotorCompensation();
+static void rebuildRotorTable();
+static constexpr float MOTOR_PROFILE_VOLTAGE_HEADROOM = 1.05f;
 static constexpr uint32_t LOCKED_PWM_HZ = 20000;
 static constexpr uint8_t LOCKED_PWM_BITS = 10;
 static constexpr uint16_t LOCKED_PWM_MAX = (1u << LOCKED_PWM_BITS) - 1;
 static constexpr uint16_t TEST_DUTY_MAX = PWM_MAX; // 0..4095 = 0..100% PWM
 static constexpr uint32_t TEST_TIME_MAX_MS = 1000;
-static constexpr float MODEL_START_CURRENT_A = 0.80f;
+static float modelStartCurrentA = 0.80f;
 // Short breakaway assistance, not a user PWM ceiling. The requested 0..4095
 // range remains available after the pulse; the model current limit can still
 // scale it back when a rotor is stalled.
-static constexpr uint16_t MODEL_START_DUTY = 180;
+static uint16_t modelStartDuty = 180;
 static constexpr float POSITION_PROFILE_MAX_DPS = 1200.0f;
 static constexpr float POSITION_PROFILE_ACCEL_DPS2 = 6000.0f;
 static constexpr float POSITION_PROFILE_KP_DPS_PER_DEG = 3.0f;
@@ -154,9 +211,19 @@ static uint32_t nextStreamAtUs = 0;
 static float currentZeroMillivolts = 1650.0f;
 static float currentFilteredMillivolts = 1650.0f;
 static bool currentFilterInitialized = false;
+static uint32_t currentFilterPreviousUs = 0;
+static motor_control::DeltaVelocityWindow encoderVelocityWindow;
 static float latestCurrentMilliamps = 0.0f;
 static float encoderVelocityDegreesPerSecond = 0.0f;
 static float encoderRawVelocityDegreesPerSecond = 0.0f;
+static float encoderFilteredMultiTurnDegrees = 0.0f;
+// Raw MT6701 angle and the user-facing multi-turn coordinate have different
+// origins after encreset. Keep the raw-origin offset so a zeroed shaft at,
+// for example, 347 deg is not interpreted as a 347 deg position error.
+static float encoderRawOriginDegrees = 0.0f;
+static int32_t encoderDeltaHistory[5] = {};
+static uint8_t encoderDeltaHistoryCount = 0;
+static uint8_t encoderDeltaHistoryIndex = 0;
 
 enum ControlMode : uint8_t {
   CONTROL_IDLE = 0,
@@ -164,9 +231,16 @@ enum ControlMode : uint8_t {
   CONTROL_VELOCITY = 2,
   CONTROL_POSITION = 3,
   CONTROL_IDENTIFY = 4,
+  CONTROL_KNOB = 5,
 };
 
 static ControlMode controlMode = CONTROL_IDLE;
+static haptic::Config knobConfig;
+static haptic::Lease knobLease;
+static float knobOriginOutputDeg = 0, knobCenterOutputDeg = 0;
+static uint32_t knobRampStartedMs = 0;
+static float knobStartBusV = 0.f;
+static float currentStartBusV = 0.f;
 static bool modelControlActive = false;
 static bool modelIdentificationEnabled = false;
 static float modelTargetCurrentAmps = 0.0f;
@@ -228,13 +302,20 @@ static int8_t currentSensePolarity = 1;
 // Cascaded controller: current -> velocity -> position. Each outer loop only
 // commands the setpoint of the next inner loop; no outer loop writes PWM.
 static constexpr uint32_t CURRENT_LOOP_PERIOD_US = 500;   // 2 kHz
-static constexpr uint32_t VELOCITY_LOOP_PERIOD_US = 5000; // 200 Hz
+// The MT6701 is mounted on the 36GP motor's rear shaft. At the catalogue
+// output speed the encoder side reaches about 48,000 deg/s; 200 Hz would move
+// 240 degrees between samples and make single-turn unwrapping ambiguous.
+// 500 Hz keeps the worst-case step near 96 degrees and also improves low-speed
+// velocity regulation without changing the 2 kHz current loop.
+static constexpr uint32_t VELOCITY_LOOP_PERIOD_US = 2000; // 500 Hz
 static constexpr uint32_t POSITION_VELOCITY_LOOP_PERIOD_US = 2000; // 500 Hz position velocity
 static constexpr uint32_t POSITION_LOOP_PERIOD_US = 5000;// 200 Hz position
 static float cascadeCurrentKp = 400.0f;      // PWM counts / A
 static float cascadeCurrentKi = 1800.0f;     // PWM counts / (A*s)
 static float cascadeVelocityKp = 0.0005f;    // A / (deg/s)
 static float cascadeVelocityKi = 0.0010f;    // A / deg
+static float cascadeVelocityLowSpeedKpFloor = 0.0060f;
+static float cascadeVelocityLowSpeedKiFloor = 0.0010f;
 static float cascadeVelocityFrictionA = 2.2f; // measured breakaway-current ceiling
 static float cascadePositionKp = 4.0f;       // (deg/s) / deg
 static float cascadePositionKi = 0.0f;       // (deg/s) / (deg*s)
@@ -283,7 +364,10 @@ static uint8_t cascadeBreakawayMotionTicks = 0;
 // Release a position command once the rotor is close and slow. The motor's
 // cogging torque can then choose the nearest quiet detent instead of a
 // high-bandwidth controller repeatedly reversing around the target.
-static constexpr float CASCADE_POSITION_RELEASE_WINDOW_DEG = 3.0f;
+// Do not release three degrees early: that made small position commands look
+// finished while the shaft was still visibly away from the target. The
+// configured deadband can widen this only up to a small, quiet hold window.
+static constexpr float CASCADE_POSITION_RELEASE_WINDOW_DEG = 0.8f;
 static constexpr float CASCADE_POSITION_RELEASE_SPEED_DPS = 12.0f;
 static constexpr float CASCADE_POSITION_RELEASE_COMMAND_DPS = 25.0f;
 static constexpr float CASCADE_POSITION_DIRECTIONAL_APPROACH_WINDOW_DEG = 12.0f;
@@ -294,15 +378,38 @@ static constexpr float CASCADE_POSITION_DIRECTIONAL_APPROACH_WINDOW_DEG = 12.0f;
 // Do not cascade two slow ramps. Direct velocity setpoints move to the new
 // target quickly and the current-reference limiter remains the single,
 // physically meaningful torque slew limit. At the UI maximum of 60000 dps
-// this still takes 100 ms, while a 3000 dps retarget takes one 200 Hz tick.
+// this still takes 100 ms, while a 3000 dps retarget takes only a few 500 Hz
+// ticks.
 static constexpr float CASCADE_DIRECT_VELOCITY_ACCELERATION_DPS2 = 600000.0f;
 static constexpr float CASCADE_VELOCITY_QUIET_CURRENT_SLEW_A_PER_S = 12.0f;
 static constexpr float CASCADE_VELOCITY_FULL_RESPONSE_ERROR_DPS = 500.0f;
 static bool cascadePositionReleased = false;
+static bool cascadePositionHoldEnabled = false;
+static uint32_t cascadeCurrentTicks = 0;
+static uint32_t cascadeCurrentMinPeriodUs = UINT32_MAX, cascadeCurrentMaxPeriodUs = 0;
+static uint32_t cascadeVelocityTicks = 0;
+static uint32_t cascadePositionTicks = 0;
+static uint32_t cascadeMaxEncoderGapUs = 0;
 static float cascadeBusVoltage = 0.0f;
 static uint32_t cascadeLastCurrentUs = 0;
 static uint32_t cascadeLastVelocityUs = 0;
 static uint32_t cascadeLastPositionUs = 0;
+static uint32_t cascadeNextCurrentUs = 0;
+static uint32_t cascadeNextVelocityUs = 0;
+static uint32_t cascadeNextPositionUs = 0;
+static esp_adc_cal_characteristics_t adcCalibration;
+static bool adcCalibrationReady = false;
+static uint32_t adcReadMaxUs = 0;
+struct CurrentTraceSample {
+  uint64_t us;
+  float referenceA, measuredA, priorPwm;
+  float rotorPositionDeg, rotorVelocityDps;
+  uint32_t encoderAgeUs;
+  float busV;
+};
+static CurrentTraceSample currentTrace[1024];
+static uint16_t currentTraceCount = 0, currentTraceLimit = 0, currentTraceDumpIndex = 0;
+static bool currentTraceDumping = false;
 static uint32_t cascadeNoCurrentResponseSinceMs = 0;
 static bool powerPathFaultLatched = false;
 static bool cascadePositionSettled = false;
@@ -313,6 +420,8 @@ static float modelInertiaKgM2 = 0.00002f;
 static float modelViscousFriction = 0.000001f;
 static bool modelHasElectricalFit = false;
 static bool modelHasMechanicalFit = false;
+static const char *motorProfileName();
+static void resetCascadeController();
 static float electricalTheta[2] = {2.0f, 0.011f};
 static float electricalCovariance[2][2] = {{100.0f, 0.0f}, {0.0f, 100.0f}};
 static float mechanicalTheta[2] = {550.0f, 0.05f};
@@ -324,7 +433,7 @@ static uint32_t modelMechanicalSamples = 0;
 static bool identificationRunActive = false;
 static uint8_t identificationPhase = 0;
 static uint32_t identificationPhaseUntilMs = 0;
-static String line;
+static usb_link::CommandLine<128> usbCommandLine;
 static uint8_t busAddress = 1;
 static uint8_t busSequence = 0;
 static bool busTransactionActive = false;
@@ -338,6 +447,12 @@ static uint32_t busPendingDeadlineMs = 0;
 static SyncMode syncMode = SYNC_OFF;
 static uint8_t syncPeerAddress = 0;
 static bool syncMotionArmed = false;
+static uint32_t syncForceStartedMs = 0;
+static float syncForceStartBusV = 0.0f;
+static interaction::Guard interactionGuard;
+static float interactionEffectiveCurrentA = 0.f;
+static interaction::Reason interactionNotice = interaction::Clear;
+static uint32_t interactionNoticeAtMs = 0;
 static uint16_t syncMaxDuty = PWM_MAX;
 static uint32_t syncTimeoutMs = 30000;
 static float syncPositionOffsetDeg = 0.0f;
@@ -372,22 +487,29 @@ static void setModelPhase(float commandSign) {
   digitalWrite(PIN_PHASE, commandSign * static_cast<float>(modelDirectionSign) > 0.0f ? HIGH : LOW);
 }
 
-class DualConsole final : public Print {
- public:
-  size_t write(uint8_t byte) override {
-    const size_t a = Serial.write(byte);
-    if (USB_ONLY_BRINGUP) return a;
-    const size_t b = BusSerial.write(byte);
-    return (a && b) ? 1 : 0;
-  }
-};
-
 static DualConsole Console;
+static bool driverSupplyValid(float busV);
+static void printDriverSupplyError(const char *operation, float busV);
 
 static bool configurePwmHardware() {
-  pwmConfiguredHz = ledcSetup(PWM_CH, PWM_HZ, PWM_BITS);
-  if (pwmConfiguredHz <= 0.0) {
-    pwmConfiguredHz = ledcSetup(PWM_CH, PWM_FALLBACK_HZ, PWM_BITS);
+  // Arduino 2.0.11/S3 defaults to 40 MHz XTAL, not 80 MHz APB. Initialise
+  // its channel-resolution bookkeeping at a supported frequency first,
+  // then explicitly select APB for 12-bit / 19.53 kHz operation.
+  pwmConfiguredHz = ledcSetup(PWM_CH, 8000, PWM_BITS);
+  if (pwmConfiguredHz > 0.0) {
+    ledc_timer_config_t timer = {};
+    timer.speed_mode = LEDC_LOW_SPEED_MODE;
+    timer.timer_num = LEDC_TIMER_0;
+    timer.duty_resolution = static_cast<ledc_timer_bit_t>(PWM_BITS);
+    timer.freq_hz = PWM_HZ;
+    timer.clk_cfg = LEDC_USE_APB_CLK;
+    if (ledc_timer_config(&timer) != ESP_OK) {
+      timer.freq_hz = PWM_FALLBACK_HZ;
+      pwmConfiguredHz = ledc_timer_config(&timer) == ESP_OK
+          ? ledc_get_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0) : 0;
+    } else {
+      pwmConfiguredHz = ledc_get_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0);
+    }
   }
   if (pwmConfiguredHz <= 0.0) {
     commandedPwmDuty = 0;
@@ -404,6 +526,13 @@ static bool configurePwmHardware() {
 }
 
 static void setPwm(uint16_t duty) {
+  if (duty > 0) digitalWrite(PIN_DECAY, runningDecayFast ? HIGH : LOW);
+  if (pwmConfiguredHz <= 0) {
+    commandedPwmDuty = 0;
+    commandedSignedPwmDuty = 0;
+    digitalWrite(PIN_ENBL, LOW);
+    return;
+  }
   if (duty > TEST_DUTY_MAX) duty = TEST_DUTY_MAX;
   commandedPwmDuty = duty;
   if (duty == 0) {
@@ -487,6 +616,14 @@ static int16_t signedPwmDuty() {
 }
 
 static void motorStop() {
+  interactionEffectiveCurrentA = 0.f;
+  interactionGuard = interaction::Guard{};
+  interactionNotice = interaction::Clear;
+  knobLease.stop();
+  // SS6952T MODE1=1 truth table: ENBL=0/DECAY=0 shorts both
+  // outputs low (brake); ENBL=0/DECAY=1 makes both outputs Z (coast).
+  // Select coast BEFORE removing ENBL to avoid an unintended brake pulse.
+  digitalWrite(PIN_DECAY, HIGH);
   disableBridgeOutput();
   syncMotionArmed = false;
   syncControlRunning = false;
@@ -540,6 +677,9 @@ static void motorStop() {
   cascadeLastVelocityUs = 0;
   cascadeLastPositionUs = 0;
   cascadePositionSettled = false;
+  // Start the next closed-loop session with an immediate encoder deadline;
+  // do not inherit a stale schedule from the previous session.
+  encoderNextReadUs = 0;
   modelStartBoostUntilMs = 0;
   // Do not carry a PWM-on sample into the idle telemetry after a stop. The
   // next ADC read will seed the filter from the actual bridge state.
@@ -559,22 +699,38 @@ static void motorStop() {
 }
 
 static bool readEncoder(uint16_t &raw, float &degrees) {
+  const uint32_t readStartedUs = micros();
+  ++encoderReadCount;
   Wire.beginTransmission(MT6701_ADDR);
   Wire.write(0x03);
-  if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom((int)MT6701_ADDR, 2) != 2) return false;
+  if (Wire.endTransmission(false) != 0) {
+    ++encoderNacks;
+    encoderReadMaxUs = max<uint32_t>(encoderReadMaxUs, micros() - readStartedUs);
+    return false;
+  }
+  if (Wire.requestFrom((int)MT6701_ADDR, 2) != 2) {
+    ++encoderShortReads;
+    encoderReadMaxUs = max<uint32_t>(encoderReadMaxUs, micros() - readStartedUs);
+    return false;
+  }
   const uint8_t hi = Wire.read();
   const uint8_t lo = Wire.read();
   raw = (static_cast<uint16_t>(hi) << 6) | (lo >> 2);
   degrees = static_cast<float>(raw) * 360.0f / 16384.0f;
   const uint32_t nowUs = micros();
+  encoderReadMaxUs = max(encoderReadMaxUs, nowUs - readStartedUs);
   if (!encoderTurnInitialized) {
     encoderPreviousRaw = raw;
     encoderMultiTurnDegrees = degrees;
+    encoderFilteredMultiTurnDegrees = degrees;
+    encoderRawOriginDegrees = 0.0f;
     encoderLastSingleTurnDegrees = degrees;
     encoderVelocityDegreesPerSecond = 0.0f;
     encoderRawVelocityDegreesPerSecond = 0.0f;
+    encoderVelocityWindow.reset();
     encoderPreviousSampleUs = nowUs;
+    encoderDeltaHistoryCount = 0;
+    encoderDeltaHistoryIndex = 0;
     encoderTurnInitialized = true;
   } else {
     int32_t delta = static_cast<int32_t>(raw) - static_cast<int32_t>(encoderPreviousRaw);
@@ -587,10 +743,36 @@ static bool readEncoder(uint16_t &raw, float &degrees) {
     const uint32_t dtUs = max<uint32_t>(1, nowUs - encoderPreviousSampleUs);
     const float maxCounts = min(8000.0f, max(256.0f,
         120000.0f * static_cast<float>(dtUs) / 1000000.0f * 16384.0f / 360.0f + 512.0f));
-    if (fabsf(static_cast<float>(delta)) > maxCounts) return false;
-    const float deltaDegrees = static_cast<float>(delta) * 360.0f / 16384.0f;
-    const float measuredVelocity = deltaDegrees * 1000000.0f / static_cast<float>(dtUs);
-    encoderRawVelocityDegreesPerSecond = measuredVelocity;
+    if (fabsf(static_cast<float>(delta)) > maxCounts) {
+      ++encoderRejectedJumps;
+      return false;
+    }
+    // A magnetic encoder without CRC can return a valid-looking but noisy
+    // angle. Median-filter the last five *increments* first; this removes an
+    // isolated I2C/sample spike without destroying a genuine fast rotation.
+    encoderDeltaHistory[encoderDeltaHistoryIndex] = delta;
+    encoderDeltaHistoryIndex = (encoderDeltaHistoryIndex + 1) % 5;
+    encoderDeltaHistoryCount = min<uint8_t>(5, encoderDeltaHistoryCount + 1);
+    int32_t sortedDeltas[5] = {};
+    for (uint8_t i = 0; i < encoderDeltaHistoryCount; ++i) {
+      sortedDeltas[i] = encoderDeltaHistory[i];
+    }
+    for (uint8_t i = 1; i < encoderDeltaHistoryCount; ++i) {
+      const int32_t value = sortedDeltas[i];
+      int8_t j = static_cast<int8_t>(i) - 1;
+      while (j >= 0 && sortedDeltas[j] > value) {
+        sortedDeltas[j + 1] = sortedDeltas[j];
+        --j;
+      }
+      sortedDeltas[j + 1] = value;
+    }
+    const int32_t filteredDelta = sortedDeltas[encoderDeltaHistoryCount / 2];
+    const float rawDeltaDegrees = static_cast<float>(delta) * 360.0f / 16384.0f;
+    const float medianDeltaDegrees = static_cast<float>(filteredDelta) *
+                                     360.0f / 16384.0f;
+    const float rawMeasuredVelocity = rawDeltaDegrees * 1000000.0f /
+                                      static_cast<float>(dtUs);
+    encoderRawVelocityDegreesPerSecond = rawMeasuredVelocity;
     // The encoder is sampled faster than the telemetry stream. Filter the
     // differentiated angle once here so both control and UI use the same
     // accepted multi-turn trajectory rather than two different velocities.
@@ -598,10 +780,46 @@ static bool readEncoder(uint16_t &raw, float &degrees) {
     // 11 deg/s. Feeding 35% of that quantised delta into the position D
     // term made a stationary shaft look like alternating motion. Keep the
     // raw sample for diagnostics, but use a slower controller estimate.
-    encoderVelocityDegreesPerSecond = encoderVelocityDegreesPerSecond * 0.85f + measuredVelocity * 0.15f;
-    encoderMultiTurnDegrees += deltaDegrees;
+    const float predictedMultiTurn = encoderFilteredMultiTurnDegrees +
+                                     medianDeltaDegrees;
+    float predictedSingleTurn = fmodf(encoderRawOriginDegrees +
+                                      predictedMultiTurn, 360.0f);
+    if (predictedSingleTurn < 0.0f) predictedSingleTurn += 360.0f;
+    float absoluteError = degrees - predictedSingleTurn;
+    if (absoluteError > 180.0f) absoluteError -= 360.0f;
+    if (absoluteError < -180.0f) absoluteError += 360.0f;
+    // The geared 25GA-370 benefits from a stronger absolute-angle correction
+    // than the high-speed 775. This is a short time constant, not a display
+    // smoothing trick: the controller and multi-turn accumulator use it too.
+    const float angleAlpha = activeMotorProfile == MOTOR_PROFILE_25GA370_6V_620RPM
+                                 ? 0.35f : 0.65f;
+    // This installed encoder has stationary noise near one 14-bit count.
+    // Median-of-increments added several ms of nonlinear phase delay and
+    // attenuated real acceleration. Use accepted raw increments for 36GP;
+    // wrap/plausibility validation above remains active. Filtering velocity
+    // once below avoids adding a second observer to the measured position.
+    const float filteredDeltaDegrees = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
+        ? rawDeltaDegrees : medianDeltaDegrees + angleAlpha * absoluteError;
+    // Four milliseconds of accepted displacement suppresses low-speed
+    // count-to-count differentiation noise without filtering position or
+    // changing the 5.2 output-shaft conversion. Raw velocity remains in S.
+    const float measuredVelocity = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
+        ? encoderVelocityWindow.update(rawDeltaDegrees, dtUs)
+        : filteredDeltaDegrees * 1000000.0f / static_cast<float>(dtUs);
+    // Keep a physical time constant when the scheduler rate changes. A fixed
+    // 0.08 coefficient at the former ~350 Hz rate delayed speed by ~33 ms.
+    // The new geared-motor loop uses 2 ms; legacy profiles keep their filter.
+    const float velocityAlpha = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
+        ? static_cast<float>(dtUs) / (2000.0f + static_cast<float>(dtUs)) : 0.08f;
+    encoderVelocityDegreesPerSecond +=
+        velocityAlpha * (measuredVelocity - encoderVelocityDegreesPerSecond);
+    encoderFilteredMultiTurnDegrees += filteredDeltaDegrees;
+    encoderMultiTurnDegrees = encoderFilteredMultiTurnDegrees;
     encoderPreviousRaw = raw;
-    encoderLastSingleTurnDegrees = degrees;
+    float filteredSingleTurn = fmodf(encoderRawOriginDegrees +
+                                     encoderMultiTurnDegrees, 360.0f);
+    if (filteredSingleTurn < 0.0f) filteredSingleTurn += 360.0f;
+    encoderLastSingleTurnDegrees = filteredSingleTurn;
     encoderPreviousSampleUs = nowUs;
   }
   return true;
@@ -616,9 +834,14 @@ static bool rebaseEncoderMultiTurn() {
   // zero operation: keep the raw angle as the unwrap origin, but expose the
   // present mechanical position as exactly 0 degrees on the multi-turn axis.
   encoderMultiTurnDegrees = 0.0f;
+  encoderFilteredMultiTurnDegrees = 0.0f;
+  encoderRawOriginDegrees = degrees;
   encoderLastSingleTurnDegrees = degrees;
   encoderVelocityDegreesPerSecond = 0.0f;
   encoderRawVelocityDegreesPerSecond = 0.0f;
+  encoderVelocityWindow.reset();
+  encoderDeltaHistoryCount = 0;
+  encoderDeltaHistoryIndex = 0;
   encoderPreviousSampleUs = micros();
   encoderTurnInitialized = true;
   return true;
@@ -637,8 +860,16 @@ static void encoderTrackingTick() {
   readEncoder(raw, degrees);
 }
 
+static uint32_t calibratedMillivolts(int pin) {
+  if (!adcCalibrationReady) return analogReadMilliVolts(pin);
+  // GPIO1/2 are ADC1 channels 0/1 on this S3 schematic. Pad, attenuation,
+  // width and eFuse calibration are configured once in setup(), not at 2 kHz.
+  const auto channel = static_cast<adc1_channel_t>(digitalPinToAnalogChannel(pin));
+  return esp_adc_cal_raw_to_voltage(adc1_get_raw(channel), &adcCalibration);
+}
+
 static float readBusVoltage(float *adcMillivolts = nullptr) {
-  const float mv = static_cast<float>(analogReadMilliVolts(PIN_VBAT_ADC));
+  const float mv = static_cast<float>(calibratedMillivolts(PIN_VBAT_ADC));
   if (adcMillivolts) *adcMillivolts = mv;
   // R23=56k from VBAT to ADC, R26=5.1k from ADC to GND.
   return mv * (56.0f + 5.1f) / 5.1f / 1000.0f;
@@ -649,13 +880,18 @@ static float readCurrentSenseMillivolts() {
   // short burst so one ADC conversion does not become a fake ampere-scale
   // spike in the 100 Hz telemetry stream.
   uint32_t total = 0;
-  for (uint8_t i = 0; i < 8; ++i) {
-    total += static_cast<uint32_t>(analogReadMilliVolts(PIN_CURRENT_ADC));
+  const uint32_t started = micros();
+  for (uint8_t i = 0; i < 4; ++i) {
+    total += calibratedMillivolts(PIN_CURRENT_ADC);
   }
-  return static_cast<float>(total) / 8.0f;
+  adcReadMaxUs = max<uint32_t>(adcReadMaxUs, micros() - started);
+  return static_cast<float>(total) / 4.0f;
 }
 
 static float filterCurrentSenseMillivolts(float rawMillivolts) {
+  const uint32_t nowUs = micros();
+  const uint32_t elapsedUs = nowUs - currentFilterPreviousUs;
+  currentFilterPreviousUs = nowUs;
   if (!currentFilterInitialized) {
     currentFilteredMillivolts = rawMillivolts;
     currentFilterInitialized = true;
@@ -668,8 +904,14 @@ static float filterCurrentSenseMillivolts(float rawMillivolts) {
   // current, so the sign-magnitude coefficient aliases carrier ripple into
   // the 2 kHz PI loop. Use a dedicated low-pass coefficient while PHASE PWM
   // is active; ordinary ENBL PWM keeps the faster shared response.
-  const float alpha = lockedAntiphaseActive ? 0.06f :
-                      (pwmDuty() == 0 ? 0.12f : 0.28f);
+  // Fixed coefficients made filtering change with call rate and with every
+  // PWM zero crossing. Preserve the commissioned 0.28 at nominal 500 us,
+  // but derive alpha from elapsed time; the whole active current loop uses
+  // one time constant even when its instantaneous PWM passes through zero.
+  const bool regulating = modelControlActive || positionActive || identificationRunActive;
+  const float tauUs = lockedAntiphaseActive ? 8080.8f
+      : (regulating || pwmDuty() != 0 ? 1522.05f : 78226.8f);
+  const float alpha = motor_control::lowPassAlpha(elapsedUs, tauUs);
   currentFilteredMillivolts += (rawMillivolts - currentFilteredMillivolts) * alpha;
   return currentFilteredMillivolts;
 }
@@ -682,24 +924,31 @@ static float readSignedCurrentMilliamps(float currentMillivolts) {
 }
 
 static void trackCurrentZeroAtIdle(float currentMillivolts) {
-  // With PWM=0 the H-bridge has no commanded motor current. Track the INA240
-  // reference/ADC drift slowly so the displayed branch current does not turn
-  // a few millivolts of thermal/ADC drift into a false hundred-milliamp value.
+  // PWM=0 does NOT prove zero winding current while a rotor is coasting.
+  // Require a stationary, uncommanded interval before adapting the offset.
+  static uint32_t stationarySinceMs = 0;
   if (pwmDuty() != 0 || positionActive || modelControlActive ||
-      identificationRunActive || !driverAwake) return;
-  currentZeroMillivolts += (currentMillivolts - currentZeroMillivolts) * 0.08f;
+      identificationRunActive || !driverAwake ||
+      fabsf(encoderVelocityDegreesPerSecond) > 2.0f) {
+    stationarySinceMs = 0;
+    return;
+  }
+  if (!stationarySinceMs) stationarySinceMs = millis();
+  if (millis() - stationarySinceMs < 500) return;
+  currentZeroMillivolts += (currentMillivolts - currentZeroMillivolts) * 0.01f;
 }
 
 static void calibrateCurrentZero() {
   setPwm(0);
   uint32_t total = 0;
   for (int i = 0; i < 32; ++i) {
-    total += static_cast<uint32_t>(analogReadMilliVolts(PIN_CURRENT_ADC));
+    total += calibratedMillivolts(PIN_CURRENT_ADC);
     delay(2);
   }
   currentZeroMillivolts = static_cast<float>(total) / 32.0f;
   currentFilteredMillivolts = currentZeroMillivolts;
   currentFilterInitialized = true;
+  currentFilterPreviousUs = micros();
 }
 
 static void runDirectBridgeTest(bool forward, uint16_t durationMs) {
@@ -714,6 +963,18 @@ static void runDirectBridgeTest(bool forward, uint16_t durationMs) {
   digitalWrite(PIN_PHASE, forward ? HIGH : LOW);
   const float startDegrees = encoderMultiTurnDegrees;
   const float startBusV = readBusVoltage();
+  if (!driverSupplyValid(startBusV)) {
+    configurePwmHardware();
+    printDriverSupplyError("dctest", startBusV);
+    return;
+  }
+  if (activeMotorProfile == MOTOR_PROFILE_25GA370_6V_620RPM &&
+      startBusV > motorProfileRatedVoltage * MOTOR_PROFILE_VOLTAGE_HEADROOM) {
+    configurePwmHardware();
+    Console.printf("ERR dctest full-high blocked for %s at %.2fV; use bounded cw/ccw PWM\n",
+                   motorProfileName(), startBusV);
+    return;
+  }
   float peakAbsCurrentMa = 0.0f;
   float minBusV = startBusV;
   float maxBusV = startBusV;
@@ -867,9 +1128,237 @@ static void resetMotorModel() {
   modelPreviousSampleUs = 0;
 }
 
+static const char *motorProfileName() {
+  if (activeMotorProfile == MOTOR_PROFILE_25GA370_6V_620RPM) {
+    return "25ga370-6v-620rpm";
+  }
+  if (activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM) {
+    return "36gp555-24v-1538rpm";
+  }
+  return "775-12-24v";
+}
+
+static const char *motorModelNamespace() {
+  if (activeMotorProfile == MOTOR_PROFILE_25GA370_6V_620RPM) {
+    return "motor370";
+  }
+  if (activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM) {
+    return "motor36gp";
+  }
+  return "motormodel";
+}
+
+static uint16_t motorProfileVoltageDutyLimit(float busV) {
+  if (!driverSupplyValid(busV)) return 0;
+  if (activeMotorProfile == MOTOR_PROFILE_775) return PWM_MAX;
+  const float safeArmatureVoltage = motorProfileRatedVoltage *
+                                    MOTOR_PROFILE_VOLTAGE_HEADROOM;
+  return static_cast<uint16_t>(constrain(
+      floorf(safeArmatureVoltage / busV * static_cast<float>(PWM_MAX)),
+      1.0f, static_cast<float>(PWM_MAX)));
+}
+
+static bool driverSupplyValid(float busV) {
+  return isfinite(busV) && busV >= SS6952T_VM_MIN_V &&
+         busV <= SS6952T_VM_MAX_V;
+}
+
+static void printDriverSupplyError(const char *operation, float busV) {
+  Console.printf("ERR %s blocked: SS6952T_VM=%.2fV requires %.1f..%.0fV; "
+                 "motor rated voltage is not the driver supply voltage\n",
+                 operation, busV, SS6952T_VM_MIN_V, SS6952T_VM_MAX_V);
+}
+
+static void applyMotorProfileDefaults() {
+  cascadePositionHoldEnabled =
+      activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM;
+  if (activeMotorProfile == MOTOR_PROFILE_25GA370_6V_620RPM) {
+    motorProfileRatedVoltage = 6.0f;
+    motorProfileRatedSpeedDps = 620.0f * 6.0f;
+    motorProfileCurrentLimitA = 2.0f;
+    modelMaxVelocityDps = 4200.0f;
+    modelMaxAccelerationDps2 = 18000.0f;
+    modelCurrentLimitAmps = motorProfileCurrentLimitA;
+    modelStartCurrentA = 0.30f;
+    modelStartDuty = 80;
+    cascadeCurrentKp = 450.0f;
+    cascadeCurrentKi = 1800.0f;
+    cascadeCurrentMaxPwm = PWM_MAX;
+    cascadeVelocityKp = 0.0015f;
+    cascadeVelocityKi = 0.0020f;
+    cascadeVelocityLowSpeedKpFloor = 0.0060f;
+    cascadeVelocityLowSpeedKiFloor = 0.0010f;
+    // The 25GA-370 needs a real breakaway torque at low speed. Keep the
+    // normal default below the driver's approximately 5 A chopper limit, but
+    // expose that full hardware envelope to commissioning through the UI.
+    cascadeVelocityMaxCurrentA = 2.50f;
+    cascadeVelocityFrictionA = 1.20f;
+    cascadeVelocityCurrentSlewAps = 40.0f;
+    cascadeVelocityBrakeSlewMultiplier = 20.0f;
+    cascadePositionKp = 8.0f;
+    cascadePositionKi = 0.0f;
+    cascadePositionKd = 0.50f;
+    cascadePositionMaxVelocityDps = 3600.0f;
+    cascadePositionMinVelocityDps = 20.0f;
+    cascadePositionMaxAccelerationDps2 = 30000.0f;
+    cascadePositionDeadbandDeg = 0.50f;
+    cascadePositionLowSpeedCurrentA = 2.00f;
+    cascadeBreakawayPulseCurrentA = 2.00f;
+    cascadeBreakawayPulseMs = 25.0f;
+    cascadeBreakawayRetryMs = 120.0f;
+    cascadeBreakawayPulseSpeedDps = 30.0f;
+    cascadeBreakawayRampAps = 120.0f;
+    positionPidMinPwm = 60.0f;
+    motorProfileGearRatio = 1.0f;
+    motorProfileOutputSpeedRpm = 620.0f;
+  } else if (activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM) {
+    // The catalogue lists 1538 rpm at the 1:5.2 gearbox output. The MT6701
+    // magnet is mounted on the rear motor shaft, so the encoder-side limit is
+    // 1538 * 5.2 rpm. Position/velocity commands remain in encoder-side
+    // degrees for compatibility; the UI states the output-side conversion.
+    motorProfileRatedVoltage = 24.0f;
+    motorProfileGearRatio = 5.2f;
+    motorProfileOutputSpeedRpm = 1538.0f;
+    motorProfileRatedSpeedDps = 1538.0f * 5.2f * 6.0f;
+    // The listing does not specify stall current. Keep the commissioning
+    // envelope below the driver's approximately 5 A chopper limit; this is a
+    // software default, not a claimed motor stall/continuous-current rating.
+    motorProfileCurrentLimitA = 2.0f;
+    modelMaxVelocityDps = motorProfileRatedSpeedDps;
+    modelMaxAccelerationDps2 = 60000.0f;
+    modelCurrentLimitAmps = motorProfileCurrentLimitA;
+    modelStartCurrentA = 0.15f;
+    modelStartDuty = 180;
+    // Commissioning gains. Validate transients with the 2 kHz RAM trace;
+    // the 100 Hz host stream alone cannot certify current-loop overshoot.
+    cascadeCurrentKp = 600.0f;
+    cascadeCurrentKi = 600000.0f;
+    cascadeCurrentMaxPwm = PWM_MAX;
+    // The old 775 low-speed floor (0.006 A/(deg/s)) drove this geared motor
+    // into +/-2 A reversals. Model-based gains are two orders lower; a small
+    // Coulomb-friction assist below 120 deg/s starts the gearbox smoothly.
+    // Kt/J ~= 101592 encoder-deg/s2/A: wn=40 rad/s, zeta=1 gives
+    // Kp=2*wn/(Kt/J) and Ki=wn^2/(Kt/J), rounded for commissioning.
+    cascadeVelocityKp = 0.00080f;
+    cascadeVelocityKi = 0.01600f;
+    // The tuning sliders are authoritative, including gains lower than the
+    // commissioning defaults. Do not silently impose a second PI controller.
+    cascadeVelocityLowSpeedKpFloor = 0.0f;
+    cascadeVelocityLowSpeedKiFloor = 0.0f;
+    cascadeVelocityMaxCurrentA = interaction::operatingCurrentLimit(modelCurrentLimitAmps);
+    cascadeVelocityFrictionA = 0.0f;
+    // The measured rotor-load harmonics require >30 A/s around 2 rear rps.
+    // A 12..15 A/s hidden limiter distorted the compensation waveform.
+    cascadeVelocityCurrentSlewAps = 80.0f;
+    cascadeVelocityBrakeSlewMultiplier = 1.0f;
+    cascadePositionKp = 12.0f;
+    cascadePositionKi = 0.0f;
+    cascadePositionKd = 0.15f;
+    cascadePositionMaxVelocityDps = 15.0f * 360.0f * motorProfileGearRatio;
+    cascadePositionMinVelocityDps = 0.0f;
+    cascadePositionMaxAccelerationDps2 = 40000.0f;
+    cascadePositionDeadbandDeg = 0.10f;
+    cascadePositionLowSpeedCurrentA = 0.0f;
+    cascadeBreakawayPulseCurrentA = 0.0f;
+    cascadeBreakawayPulseMs = 15.0f;
+    cascadeBreakawayRetryMs = 120.0f;
+    cascadeBreakawayPulseSpeedDps = 40.0f;
+    cascadeBreakawayRampAps = 80.0f;
+    positionPidMinPwm = 60.0f;
+  } else {
+    motorProfileRatedVoltage = 24.0f;
+    motorProfileGearRatio = 1.0f;
+    motorProfileOutputSpeedRpm = 0.0f;
+    motorProfileRatedSpeedDps = 60000.0f;
+    motorProfileCurrentLimitA = BOARD_CURRENT_LIMIT_A;
+    modelMaxVelocityDps = 60000.0f;
+    modelMaxAccelerationDps2 = 60000.0f;
+    modelCurrentLimitAmps = BOARD_CURRENT_LIMIT_A;
+    modelStartCurrentA = 0.80f;
+    modelStartDuty = 180;
+    cascadeCurrentKp = 400.0f;
+    cascadeCurrentKi = 1800.0f;
+    cascadeCurrentMaxPwm = PWM_MAX;
+    cascadeVelocityKp = 0.0005f;
+    cascadeVelocityKi = 0.0010f;
+    cascadeVelocityLowSpeedKpFloor = 0.0060f;
+    cascadeVelocityLowSpeedKiFloor = 0.0010f;
+    cascadeVelocityMaxCurrentA = 4.8f;
+    cascadeVelocityFrictionA = 2.2f;
+    cascadeVelocityCurrentSlewAps = 30.0f;
+    cascadeVelocityBrakeSlewMultiplier = 30.0f;
+    cascadePositionKp = 4.0f;
+    cascadePositionKi = 0.0f;
+    cascadePositionKd = 0.25f;
+    cascadePositionMaxVelocityDps = 6000.0f;
+    cascadePositionMinVelocityDps = 0.0f;
+    cascadePositionMaxAccelerationDps2 = 100000.0f;
+    cascadePositionDeadbandDeg = 0.10f;
+    cascadePositionLowSpeedCurrentA = 2.0f;
+    cascadeBreakawayPulseCurrentA = 2.2f;
+    cascadeBreakawayPulseMs = 25.0f;
+    cascadeBreakawayRetryMs = 120.0f;
+    cascadeBreakawayPulseSpeedDps = 120.0f;
+    cascadeBreakawayRampAps = 200.0f;
+    positionPidMinPwm = 220.0f;
+  }
+  resetCascadeController();
+}
+
+static void saveMotorProfileSelection() {
+  Preferences preferences;
+  if (!preferences.begin("motorcfg", false)) return;
+  preferences.putUChar("profile", static_cast<uint8_t>(activeMotorProfile));
+  preferences.end();
+}
+
+static void loadMotorProfileSelection() {
+  Preferences preferences;
+  if (!preferences.begin("motorcfg", true)) return;
+  const uint8_t stored = preferences.getUChar("profile", MOTOR_PROFILE_775);
+  activeMotorProfile = stored == MOTOR_PROFILE_25GA370_6V_620RPM
+                           ? MOTOR_PROFILE_25GA370_6V_620RPM
+                           : stored == MOTOR_PROFILE_36GP555_24V_1538RPM
+                               ? MOTOR_PROFILE_36GP555_24V_1538RPM
+                               : MOTOR_PROFILE_775;
+  preferences.end();
+}
+
+static void printMotorProfile() {
+  const float busV = readBusVoltage();
+  Console.printf("MOTOR_PROFILE id=%s rated_voltage=%.2fV rated_speed=%.0fdeg/s current_limit=%.2fA gear=%.2f output_speed=%.0frpm encoder_side=motor_rear_shaft bus=%.2fV voltage_pwm_limit=%u/4095 identified=%d/%d\n",
+                 motorProfileName(), motorProfileRatedVoltage,
+                 motorProfileRatedSpeedDps, motorProfileCurrentLimitA,
+                 motorProfileGearRatio, motorProfileOutputSpeedRpm, busV,
+                 static_cast<unsigned>(motorProfileVoltageDutyLimit(busV)),
+                 modelHasElectricalFit ? 1 : 0,
+                 modelHasMechanicalFit ? 1 : 0);
+}
+
+// Configuration is board-owned, not a browser-only scale. Each profile has
+// its own stored values; loading never restores a motion target.
+static void loadMotorSettings() {
+  Preferences preferences;
+  if (!preferences.begin(motorModelNamespace(), true)) return;
+  const float voltage = preferences.getFloat("rated_v", motorProfileRatedVoltage);
+  const float current = preferences.getFloat("max_a", motorProfileCurrentLimitA);
+  const float gear = preferences.getFloat("gear", motorProfileGearRatio);
+  preferences.end();
+  const float ceiling = activeMotorProfile == MOTOR_PROFILE_775 ? BOARD_CURRENT_LIMIT_A : 2.0f;
+  if (!isfinite(voltage) || voltage < 3 || voltage > 24 ||
+      !isfinite(current) || current < 0.1f || current > ceiling ||
+      !isfinite(gear) || gear < 1 || gear > 1000) return;
+  motorProfileRatedVoltage = voltage;
+  motorProfileCurrentLimitA = modelCurrentLimitAmps = current;
+  motorProfileGearRatio = gear;
+  motorProfileOutputSpeedRpm = motorProfileRatedSpeedDps / (6.0f * gear);
+  cascadeVelocityMaxCurrentA = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
+      ? interaction::operatingCurrentLimit(current) : min(cascadeVelocityMaxCurrentA, current);
+}
+
 static void saveMotorModel() {
   Preferences preferences;
-  if (!preferences.begin("motormodel", false)) return;
+  if (!preferences.begin(motorModelNamespace(), false)) return;
   preferences.putFloat("r_ohm", modelResistanceOhm);
   preferences.putFloat("ke_vsr", modelKeVoltSecondsPerRad);
   preferences.putFloat("acc_per_a", mechanicalTheta[0]);
@@ -882,14 +1371,17 @@ static void saveMotorModel() {
 }
 
 static void loadMotorModel() {
+  loadRotorCompensation();
   Preferences preferences;
-  if (!preferences.begin("motormodel", true)) return;
+  if (!preferences.begin(motorModelNamespace(), true)) return;
   if (preferences.getBool("elec_fit", false)) {
-    modelResistanceOhm = constrain(preferences.getFloat("r_ohm", modelResistanceOhm), 0.05f, 20.0f);
-    modelKeVoltSecondsPerRad = constrain(preferences.getFloat("ke_vsr", modelKeVoltSecondsPerRad), 0.0001f, 0.2f);
+    const float storedResistance = preferences.getFloat("r_ohm", modelResistanceOhm);
+    const float storedKe = preferences.getFloat("ke_vsr", modelKeVoltSecondsPerRad);
+    modelResistanceOhm = constrain(storedResistance, 0.05f, 20.0f);
+    modelKeVoltSecondsPerRad = constrain(storedKe, 0.0001f, 0.2f);
     electricalTheta[0] = modelResistanceOhm;
     electricalTheta[1] = modelKeVoltSecondsPerRad;
-    modelHasElectricalFit = true;
+    modelHasElectricalFit = modelKeVoltSecondsPerRad > 0.001f;
   }
   if (preferences.getBool("mech_fit", false)) {
     mechanicalTheta[0] = constrain(preferences.getFloat("acc_per_a", mechanicalTheta[0]), 200.0f, 200000.0f);
@@ -901,6 +1393,66 @@ static void loadMotorModel() {
   const int8_t storedSensePolarity = preferences.getChar("sense", 1);
   currentSensePolarity = storedSensePolarity < 0 ? -1 : 1;
   preferences.end();
+}
+
+static bool rotorCompensationValid(const RotorCompensation &c) {
+  if (c.version != 1 || !isfinite(c.scale) || c.scale < 0 || c.scale > 1.2f ||
+      !isfinite(c.coulombA) || c.coulombA < 0 || c.coulombA > .3f ||
+      !isfinite(c.offsetA) || fabsf(c.offsetA) > .1f) return false;
+  for (int k=0; k<ROTOR_HARMONICS; ++k)
+    for (int j=0; j<2; ++j)
+      if (!isfinite(c.harmonic[k][j]) || fabsf(c.harmonic[k][j]) > .4f) return false;
+  return true;
+}
+
+static void rebuildRotorTable() {
+  // Expensive trigonometry only while STOPped, never at 500 Hz.
+  for (int degree=0; degree<360; ++degree) {
+    float value = 0;
+    for (int k=0; k<ROTOR_HARMONICS; ++k) {
+      const float phase = (k+1)*degree*.01745329252f;
+      value += rotorComp.harmonic[k][0]*sinf(phase) + rotorComp.harmonic[k][1]*cosf(phase);
+    }
+    rotorTable[degree] = constrain(value, -.3f, .3f);
+  }
+}
+
+static void loadRotorCompensation() {
+  rotorComp = RotorCompensation{};
+  if (activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM) {
+    Preferences p;
+    if (p.begin("rotor_load", true)) {
+      RotorCompensation stored;
+      if (p.getBytesLength("36gp") == sizeof(stored) &&
+          p.getBytes("36gp", &stored, sizeof(stored)) == sizeof(stored) &&
+          rotorCompensationValid(stored)) rotorComp = stored;
+      p.end();
+    }
+  }
+  rebuildRotorTable();
+}
+
+static bool invalidateStoredRotorCompensation() {
+  if (activeMotorProfile != MOTOR_PROFILE_36GP555_24V_1538RPM) return true;
+  RotorCompensation cleared;
+  Preferences p;
+  const bool opened = p.begin("rotor_load", false);
+  const bool saved = opened && p.putBytes("36gp", &cleared, sizeof(cleared)) == sizeof(cleared);
+  if (opened) p.end();
+  rotorComp = RotorCompensation{};
+  rebuildRotorTable();
+  if (!saved) Console.println("ERR calibration_invalidation_failed; sign/model change rejected");
+  return saved;
+}
+
+static float rotorFeedforwardA(float velocityRequest) {
+  if (activeMotorProfile != MOTOR_PROFILE_36GP555_24V_1538RPM || rotorComp.scale <= 0) return 0;
+  const float angle = encoderPreviousRaw * (360.0f/16384.0f);
+  const int index = static_cast<int>(angle);
+  const float fraction = angle - index;
+  const float periodic = rotorTable[index] + fraction*(rotorTable[(index+1)%360]-rotorTable[index]);
+  const float friction = rotorComp.coulombA * tanhf(velocityRequest / 40.0f);
+  return constrain(rotorComp.scale*(periodic + friction + rotorComp.offsetA), -.3f, .3f);
 }
 
 static void rlsUpdate2(float theta[2], float covariance[2][2], float phi0, float phi1,
@@ -926,7 +1478,7 @@ static void rlsUpdate2(float theta[2], float covariance[2][2], float phi0, float
 
 static void updateMotorModel(float busV, float currentAmps, float velocityDps,
                              int16_t signedPwm) {
-  if (!modelIdentificationEnabled || busV < 2.0f || abs(signedPwm) < 40) return;
+  if (!modelIdentificationEnabled || !driverSupplyValid(busV) || abs(signedPwm) < 40) return;
   const uint32_t nowUs = micros();
   const float dt = modelPreviousSampleUs == 0 ? 0.0f :
                    static_cast<float>(nowUs - modelPreviousSampleUs) / 1000000.0f;
@@ -947,7 +1499,12 @@ static void updateMotorModel(float busV, float currentAmps, float velocityDps,
     modelKeVoltSecondsPerRad = constrain(electricalTheta[1], 0.0001f, 0.2f);
     electricalTheta[0] = modelResistanceOhm;
     electricalTheta[1] = modelKeVoltSecondsPerRad;
-    if (++modelElectricalSamples > 20) modelHasElectricalFit = true;
+    // A low-duty run can identify resistance while leaving the voltage/speed
+    // excitation too small to identify Ke. Do not persist or use a fit that
+    // has collapsed onto the numerical lower bound.
+    if (++modelElectricalSamples > 20 && modelKeVoltSecondsPerRad > 0.001f) {
+      modelHasElectricalFit = true;
+    }
   }
   if (dt > 0.0002f && dt < 0.1f && modelElectricalSamples > 20) {
     const float acceleration = (omega - modelPreviousVelocityRadPerSecond) / dt;
@@ -969,11 +1526,13 @@ static const char *controlModeName() {
     case CONTROL_VELOCITY: return "velocity";
     case CONTROL_POSITION: return "position";
     case CONTROL_IDENTIFY: return "identify";
+    case CONTROL_KNOB: return "knob";
     default: return "idle";
   }
 }
 
 static float modelTargetForTelemetry() {
+  if (controlMode == CONTROL_KNOB) return knobCenterOutputDeg * motorProfileGearRatio;
   if (controlMode == CONTROL_POSITION) return modelTargetPositionDegrees;
   if (controlMode == CONTROL_VELOCITY) return modelTargetVelocityDps;
   if (controlMode == CONTROL_CURRENT) return modelTargetCurrentAmps * 1000.0f;
@@ -1009,11 +1568,13 @@ static void modelControlTick() {
   if (!readEncoder(raw, singleDegrees)) return;
   float busAdcMv = 0.0f;
   const float busV = readBusVoltage(&busAdcMv);
-  if (busV < 2.0f) {
+  if (!driverSupplyValid(busV)) {
     motorStop();
-    Console.printf("MODEL bus_low=%.2fV\n", busV);
+    printDriverSupplyError("model", busV);
     return;
   }
+  const uint16_t effectiveMaxDuty = min<uint16_t>(
+      modelMaxDuty, motorProfileVoltageDutyLimit(busV));
   const float currentRawMv = readCurrentSenseMillivolts();
   const float currentMv = filterCurrentSenseMillivolts(currentRawMv);
   const float currentAmps = readSignedCurrentMilliamps(currentMv) / 1000.0f;
@@ -1038,7 +1599,7 @@ static void modelControlTick() {
       const float pidError = (positionPidSettled ||
                               fabsf(positionError) <= positionPidDeadbandDeg)
                                ? 0.0f : positionError;
-      const float pidLimit = min(static_cast<float>(modelMaxDuty), positionPidMaxPwm);
+      const float pidLimit = min(static_cast<float>(effectiveMaxDuty), positionPidMaxPwm);
       float pwmOutput = 0.0f;
       if (pidError == 0.0f) {
         // A deadband must be a real no-drive band. Previously the D term was
@@ -1108,7 +1669,7 @@ static void modelControlTick() {
                       modelTargetPositionDegrees, encoderMultiTurnDegrees,
                       positionError, positionPidKp, positionPidKi,
                       positionPidKd, pwmOutput, positionPidSlewedPwm,
-                      static_cast<unsigned>(modelMaxDuty));
+                      static_cast<unsigned>(effectiveMaxDuty));
       }
       return;
     } else {
@@ -1161,10 +1722,10 @@ static void modelControlTick() {
     const bool allowLowSpeedFloor = controlMode == CONTROL_VELOCITY || allowPositionStartFloor;
     const float breakawayCurrent = controlMode == CONTROL_VELOCITY
                                        ? (startBoostActive
-                                              ? MODEL_START_CURRENT_A
+                                              ? modelStartCurrentA
                                               : constrain(fabsf(velocityTargetDps) * 0.0008f,
-                                                          0.08f, MODEL_START_CURRENT_A))
-                                       : MODEL_START_CURRENT_A;
+                                                          0.08f, modelStartCurrentA))
+                                       : modelStartCurrentA;
     if (fabsf(velocityTargetDps) > 20.0f && fabsf(currentTargetAmps) < breakawayCurrent &&
         (startBoostActive || (allowLowSpeedFloor && fabsf(measuredVelocityDps) < 100.0f))) {
       currentTargetAmps = copysignf(breakawayCurrent, velocityTargetDps);
@@ -1209,7 +1770,7 @@ static void modelControlTick() {
                                  max(modelCurrentLimitAmps, measuredCurrentInCommandDirection);
   }
   const uint16_t duty = static_cast<uint16_t>(constrain(currentLimitedDutyCommand, 0.0f,
-                                                        static_cast<float>(modelMaxDuty)));
+                                                        static_cast<float>(effectiveMaxDuty)));
   const bool lowSpeedAssist = (controlMode == CONTROL_VELOCITY || controlMode == CONTROL_POSITION) &&
                                fabsf(velocityTargetDps) > 20.0f && fabsf(outputVelocityError) > 50.0f &&
                                fabsf(measuredVelocityDps) < 35.0f &&
@@ -1226,8 +1787,8 @@ static void modelControlTick() {
                                     fabsf(measuredVelocityDps) < 80.0f;
   const bool positionFinePulse = positionFineApproach && (now % 50u < 8u);
   const uint16_t modelAssistDuty = static_cast<uint16_t>(constrain(
-      ceilf(max(0.0f, dutyFeedforward)), 0.0f, static_cast<float>(modelMaxDuty)));
-  const uint16_t assistDuty = max<uint16_t>(MODEL_START_DUTY, modelAssistDuty);
+      ceilf(max(0.0f, dutyFeedforward)), 0.0f, static_cast<float>(effectiveMaxDuty)));
+  const uint16_t assistDuty = max<uint16_t>(modelStartDuty, modelAssistDuty);
   // A fixed 180-count breakaway pulse is excessive for a low speed target.
   // Scale only the bounded startup assist with the requested speed; the
   // user's normal PWM ceiling remains the full 0..4095 range.
@@ -1265,6 +1826,7 @@ static void modelControlTick() {
 }
 
 static void resetCascadeController() {
+  cascadeNextCurrentUs = cascadeNextVelocityUs = cascadeNextPositionUs = 0;
   cascadeVelocityRequestedDps = 0.0f;
   cascadeVelocityCommandDps = 0.0f;
   cascadeCurrentCommandA = 0.0f;
@@ -1289,6 +1851,7 @@ static void resetCascadeController() {
   cascadeLastVelocityUs = 0;
   cascadeLastPositionUs = 0;
   cascadePositionSettled = false;
+  encoderNextReadUs = 0;
 }
 
 static void updateCascadePositionTrajectory(float dt) {
@@ -1334,7 +1897,17 @@ static void cascadeControlTick() {
     return;
   }
   if (!modelControlActive || !driverAwake) return;
-  const uint32_t nowUs = micros();
+  if (controlMode == CONTROL_KNOB && !knobLease.alive(millis())) {
+    motorStop();
+    Console.println("KNOB stopped lease_or_session_expired");
+    return;
+  }
+  if (pwmConfiguredHz <= 0) {
+    motorStop();
+    Console.println("CASCADE fault pwm_not_configured");
+    return;
+  }
+  uint32_t nowUs = micros();
   const uint32_t nowMs = millis();
   if (modelStopAtMs != 0 && static_cast<int32_t>(nowMs - modelStopAtMs) >= 0) {
     motorStop();
@@ -1347,6 +1920,41 @@ static void cascadeControlTick() {
     return;
   }
 
+  // Sample at 1 kHz independently of the 500 Hz velocity controller. Take
+  // the due sample BEFORE testing freshness, not after declaring a fault.
+  // Do not accept a late sample across an already ambiguous half-turn gap.
+  uint32_t encoderAgeUs = nowUs - encoderPreviousSampleUs;
+  cascadeMaxEncoderGapUs = max(cascadeMaxEncoderGapUs, encoderAgeUs);
+  float observedSpeed = max(fabsf(encoderVelocityDegreesPerSecond),
+                           fabsf(encoderRawVelocityDegreesPerSecond));
+  const float blindTravelDeg = observedSpeed * encoderAgeUs * 1e-6f;
+  if (encoderPreviousSampleUs && blindTravelDeg >= 150.0f) {
+    motorStop();
+    Console.printf("CASCADE fault encoder_ambiguous age_us=%lu travel_deg=%.1f\n",
+                   static_cast<unsigned long>(encoderAgeUs), blindTravelDeg);
+    return;
+  }
+  if (motor_control::takeDeadline(nowUs, encoderNextReadUs, ENCODER_PERIOD_US)) {
+    uint16_t raw = 0; float singleDegrees = 0;
+    readEncoder(raw, singleDegrees);
+    nowUs = micros();
+    encoderAgeUs = nowUs - encoderPreviousSampleUs;
+    observedSpeed = max(fabsf(encoderVelocityDegreesPerSecond),
+                        fabsf(encoderRawVelocityDegreesPerSecond));
+  }
+  const uint32_t encoderDeadlineUs = motor_control::encoderDeadlineUs(observedSpeed);
+  if (motor_control::encoderStale(nowUs, encoderPreviousSampleUs, observedSpeed)) {
+    motorStop();
+    Console.printf("CASCADE fault encoder_stale age_us=%lu limit_us=%lu nack=%lu short=%lu rejected=%lu read_max_us=%lu\n",
+                   static_cast<unsigned long>(encoderAgeUs),
+                   static_cast<unsigned long>(encoderDeadlineUs),
+                   static_cast<unsigned long>(encoderNacks),
+                   static_cast<unsigned long>(encoderShortReads),
+                   static_cast<unsigned long>(encoderRejectedJumps),
+                   static_cast<unsigned long>(encoderReadMaxUs));
+    return;
+  }
+
   // Keep the final target visible in telemetry while releasing the actuator
   // near the target. A new POS command clears this flag and re-arms control.
   // The encoder still runs in this state: releasing torque must not freeze the
@@ -1355,9 +1963,6 @@ static void cascadeControlTick() {
     if (cascadeLastVelocityUs == 0 ||
         nowUs - cascadeLastVelocityUs >= POSITION_VELOCITY_LOOP_PERIOD_US) {
       cascadeLastVelocityUs = nowUs;
-      uint16_t raw = 0;
-      float singleDegrees = 0.0f;
-      readEncoder(raw, singleDegrees);
       if (cascadeLastPositionUs == 0 ||
           nowUs - cascadeLastPositionUs >= POSITION_LOOP_PERIOD_US) {
         cascadeLastPositionUs = nowUs;
@@ -1368,35 +1973,43 @@ static void cascadeControlTick() {
     cascadeVelocityCommandDps = 0.0f;
     cascadeCurrentCommandA = 0.0f;
     cascadeSignedPwm = 0.0f;
-    cascadeMeasuredCurrentA = 0.0f;
+    if (motor_control::due(nowUs, cascadeLastCurrentUs, CURRENT_LOOP_PERIOD_US)) {
+      cascadeLastCurrentUs = nowUs;
+      ++cascadeCurrentTicks;
+      const float mv = filterCurrentSenseMillivolts(readCurrentSenseMillivolts());
+      cascadeMeasuredCurrentA = readSignedCurrentMilliamps(mv) / 1000.0f;
+      latestCurrentMilliamps = cascadeMeasuredCurrentA * 1000.0f;
+    }
     return;
   }
 
   // Position mode samples the encoder/velocity loop at 500 Hz so a direct
   // drive breakaway pulse can be detected and braked before it crosses a
-  // full detent. Direct velocity mode retains the validated 200 Hz rate.
+  // full detent. Direct velocity mode also runs at 500 Hz so the rear-shaft
+  // encoder remains unambiguous at the 36GP catalogue speed.
   const uint32_t velocityPeriodUs = controlMode == CONTROL_POSITION
       ? POSITION_VELOCITY_LOOP_PERIOD_US : VELOCITY_LOOP_PERIOD_US;
-  if (cascadeLastVelocityUs == 0 ||
-      nowUs - cascadeLastVelocityUs >= velocityPeriodUs) {
-    const float velocityDt = cascadeLastVelocityUs == 0
+  const bool velocityDue = motor_control::takeDeadline(nowUs, cascadeNextVelocityUs, velocityPeriodUs);
+  const float velocityDt = cascadeLastVelocityUs == 0
         ? static_cast<float>(velocityPeriodUs) / 1000000.0f
         : static_cast<float>(nowUs - cascadeLastVelocityUs) / 1000000.0f;
+  if (velocityDue) {
     cascadeLastVelocityUs = nowUs;
-    uint16_t raw = 0;
-    float singleDegrees = 0.0f;
-    if (!readEncoder(raw, singleDegrees)) return;
+    ++cascadeVelocityTicks;
+  }
 
-    if (cascadeLastPositionUs == 0 ||
-        nowUs - cascadeLastPositionUs >= POSITION_LOOP_PERIOD_US) {
+  // Independent 5 ms schedule. Nesting this inside the 2 ms velocity block
+  // rounded the position interval up to 6 ms (167 Hz rather than 200 Hz).
+    if (motor_control::takeDeadline(nowUs, cascadeNextPositionUs, POSITION_LOOP_PERIOD_US)) {
       const float positionDt = cascadeLastPositionUs == 0
           ? static_cast<float>(POSITION_LOOP_PERIOD_US) / 1000000.0f
           : static_cast<float>(nowUs - cascadeLastPositionUs) / 1000000.0f;
       cascadeLastPositionUs = nowUs;
+      ++cascadePositionTicks;
       cascadeBusVoltage = readBusVoltage();
-      if (cascadeBusVoltage < 2.0f) {
+      if (!driverSupplyValid(cascadeBusVoltage)) {
         motorStop();
-        Console.printf("CASCADE bus_low=%.2fV\n", cascadeBusVoltage);
+        printDriverSupplyError("cascade", cascadeBusVoltage);
         return;
       }
       if (controlMode == CONTROL_POSITION) {
@@ -1404,8 +2017,8 @@ static void cascadeControlTick() {
                                  encoderMultiTurnDegrees;
         const float releaseWindow = max(0.35f, min(
             CASCADE_POSITION_RELEASE_WINDOW_DEG,
-            max(1.0f, cascadePositionDeadbandDeg)));
-        if (!cascadeBreakawayPulseActive &&
+            max(0.35f, cascadePositionDeadbandDeg)));
+        if (!cascadePositionHoldEnabled && !cascadeBreakawayPulseActive &&
             fabsf(finalError) <= releaseWindow &&
             fabsf(encoderVelocityDegreesPerSecond) <=
                 CASCADE_POSITION_RELEASE_SPEED_DPS &&
@@ -1417,7 +2030,6 @@ static void cascadeControlTick() {
           cascadeVelocityCommandDps = 0.0f;
           cascadeCurrentCommandA = 0.0f;
           cascadeSignedPwm = 0.0f;
-          cascadeMeasuredCurrentA = 0.0f;
           // In sign-magnitude mode PWM=0 disables ENBL. In locked-antiphase
           // mode explicitly disable ENBL once; do not re-enable the bridge on
           // every 500 Hz tick while the position command is released.
@@ -1452,19 +2064,40 @@ static void cascadeControlTick() {
         } else {
           cascadePositionIntegral *= max(0.0f, 1.0f - 4.0f * positionDt);
         }
-        // Full-speed position profile. Far from the target the velocity loop
-        // receives the configured maximum speed. Inside the physical braking
-        // distance it follows v=sqrt(2*a*x), so a large move is no longer
-        // limited to Kp*error yet still brakes before crossing the target.
-        // At the 100 kdeg/s^2 default, 6000 deg/s is reached in 60 ms and the
-        // deceleration phase starts about 180 degrees before the target.
+        // Real position PID outer loop. The position parameters must affect
+        // the next-loop velocity reference; previously this block ignored
+        // Kp/Ki/Kd and always used a hard-coded full-speed profile, making the
+        // sliders appear broken. Kd is the measured-velocity term because
+        // d(position_error)/dt = -measured_velocity.
+        const float positionP = cascadePositionKp * finalError;
+        const float positionI = cascadePositionKi * cascadePositionIntegral;
+        const float positionD = -cascadePositionKd *
+                                encoderVelocityDegreesPerSecond;
+        float positionVelocityRequest = positionP + positionI + positionD;
+        if (fabsf(finalError) <= cascadePositionDeadbandDeg) {
+          positionVelocityRequest = 0.0f;
+        } else if (fabsf(positionVelocityRequest) <
+                   cascadePositionMinVelocityDps) {
+          // A configurable minimum is useful only outside the final deadband;
+          // it is still signed by the position error so it cannot command a
+          // wrong-way crawl when the D term is damping a fast approach.
+          positionVelocityRequest = copysignf(
+              cascadePositionMinVelocityDps, finalError);
+        }
+        // Keep the PID response within the identified acceleration envelope.
+        // This is a constraint on the reference, not a replacement for PID.
         const float brakingDistance = max(0.0f,
             fabsf(finalError) - cascadePositionDeadbandDeg);
         const float brakingSpeed = sqrtf(2.0f *
             max(1.0f, cascadePositionMaxAccelerationDps2) * brakingDistance);
-        float positionVelocityRequest = copysignf(
-            min(cascadePositionMaxVelocityDps, brakingSpeed), finalError);
-        if (brakingDistance <= 0.0f) positionVelocityRequest = 0.0f;
+        const float referenceSpeedLimit = min(
+            cascadePositionMaxVelocityDps, brakingSpeed);
+        if (brakingDistance <= 0.0f) {
+          positionVelocityRequest = 0.0f;
+        } else if (fabsf(positionVelocityRequest) > referenceSpeedLimit) {
+          positionVelocityRequest = copysignf(referenceSpeedLimit,
+                                              positionVelocityRequest);
+        }
         cascadeVelocityRequestedDps = constrain(
             positionVelocityRequest,
             -cascadePositionMaxVelocityDps, cascadePositionMaxVelocityDps);
@@ -1478,6 +2111,7 @@ static void cascadeControlTick() {
       }
     }
 
+  if (velocityDue) {
     if (controlMode == CONTROL_POSITION || controlMode == CONTROL_VELOCITY) {
       if (controlMode == CONTROL_POSITION) {
         // The position outer loop is a final-error PD law.  Slew its velocity
@@ -1512,6 +2146,7 @@ static void cascadeControlTick() {
       const float finalPositionError = controlMode == CONTROL_POSITION
           ? modelTargetPositionDegrees - encoderMultiTurnDegrees : 0.0f;
       const bool coarseDirectionalApproach =
+          activeMotorProfile != MOTOR_PROFILE_36GP555_24V_1538RPM &&
           controlMode == CONTROL_POSITION &&
           fabsf(finalPositionError) >
               max(CASCADE_POSITION_DIRECTIONAL_APPROACH_WINDOW_DEG,
@@ -1528,15 +2163,23 @@ static void cascadeControlTick() {
           controlMode == CONTROL_POSITION &&
           fabsf(finalPositionError) > max(0.25f, cascadePositionDeadbandDeg * 2.0f) &&
           fabsf(cascadeVelocityCommandDps) < 200.0f;
-      // In position mode, a direct-drive 775 may need extra torque to leave a
-      // magnetic detent. Do not apply a fixed high-current pulse: ramp the
+      // A stopped motor may need extra torque to leave gearbox/static
+      // friction. Do not apply a fixed high-current PWM: ramp a bounded
       // current reference and terminate it as soon as real movement is seen.
-      // The velocity/current loops then take over and brake/hold the shaft.
+      // This applies to both position moves and direct low-speed commands;
+      // the velocity/current loops then take over and brake/hold the shaft.
       const bool positionNeedsBreakaway = lowSpeedPositionMove &&
           fabsf(encoderVelocityDegreesPerSecond) < 8.0f;
-      const bool breakawayCandidate = controlMode == CONTROL_POSITION &&
-          motionRequested &&
-          (rotorStationary || positionNeedsBreakaway);
+      const bool velocityNeedsBreakaway =
+          controlMode == CONTROL_VELOCITY && rotorStationary;
+      const bool breakawayCandidate = motionRequested &&
+          ((controlMode == CONTROL_POSITION &&
+            (rotorStationary || positionNeedsBreakaway)) ||
+           velocityNeedsBreakaway);
+      const float breakawayDirectionRequest =
+          controlMode == CONTROL_POSITION
+              ? finalPositionError
+              : cascadeVelocityCommandDps;
       const uint32_t retryUs = static_cast<uint32_t>(
           max(1.0f, cascadeBreakawayRetryMs) * 1000.0f);
       const bool retryAllowed = cascadeBreakawayLastAttemptUs == 0 ||
@@ -1567,9 +2210,13 @@ static void cascadeControlTick() {
         const bool movedByDistance = directedDisplacement >= 4.0f;
         const bool pulseExpired = static_cast<int32_t>(
             nowUs - cascadeBreakawayPulseUntilUs) >= 0;
+        const float directionChangeTolerance =
+            controlMode == CONTROL_POSITION
+                ? cascadePositionDeadbandDeg
+                : 0.05f;
         const bool targetDirectionChanged =
-            finalPositionError * static_cast<float>(
-                cascadeBreakawayDirectionSign) < -cascadePositionDeadbandDeg;
+            breakawayDirectionRequest * static_cast<float>(
+                cascadeBreakawayDirectionSign) < -directionChangeTolerance;
         if (movedBySpeed || movedByDistance || pulseExpired ||
             targetDirectionChanged) {
           cascadeBreakawayPulseActive = false;
@@ -1588,12 +2235,13 @@ static void cascadeControlTick() {
               max(1.0f, cascadeBreakawayPulseMs) * 1000.0f);
           cascadeBreakawayLastAttemptUs = nowUs;
           cascadeBreakawayStartPositionDeg = encoderMultiTurnDegrees;
-          cascadeBreakawayDirectionSign = finalPositionError >= 0.0f ? 1 : -1;
+          cascadeBreakawayDirectionSign =
+              breakawayDirectionRequest >= 0.0f ? 1 : -1;
           cascadeBreakawayMotionTicks = 0;
           cascadeBreakawayFeedForwardA = 0.02f *
               static_cast<float>(cascadeBreakawayDirectionSign);
-          // Do not carry a previous velocity integral into the impulse.
-          cascadeVelocityIntegral = 0.0f;
+          // Preserve the load/friction torque learned between assists. Freeze
+          // integration during the assist instead of erasing it every 120 ms.
         }
       }
       if (cascadeBreakawayPulseActive && !pulseEndedThisTick) {
@@ -1625,21 +2273,35 @@ static void cascadeControlTick() {
         runningFeedForwardA = constrain(runningFeedForwardA,
             -cascadeVelocityFrictionA, cascadeVelocityFrictionA);
       }
-      const float velocityFeedForward = runningFeedForwardA +
-                                       cascadeBreakawayFeedForwardA;
+      float staticFeedForwardA = 0.0f;
+      const bool forwardTorqueNeeded = motionRequested &&
+          velocityError * cascadeVelocityCommandDps > 0.0f &&
+          (controlMode == CONTROL_VELOCITY ||
+           finalPositionError * cascadeVelocityCommandDps > 0.0f);
+      if (forwardTorqueNeeded && cascadeVelocityFrictionA > 0.0f) {
+        const float blend = constrain(
+            1.0f - fabsf(encoderVelocityDegreesPerSecond) / 120.0f, 0.0f, 1.0f);
+        staticFeedForwardA = copysignf(
+            cascadeVelocityFrictionA * blend * blend, cascadeVelocityCommandDps);
+      }
+      const float velocityFeedForward = runningFeedForwardA + staticFeedForwardA +
+                                        rotorFeedforwardA(cascadeVelocityCommandDps);
+      const float effectiveCurrentLimitA = min(cascadeVelocityMaxCurrentA,
+                                               modelCurrentLimitAmps);
       // The already-validated high-speed gains remain untouched. Below
       // 1000 deg/s the direct-drive 775 needs a stronger, continuous PI loop;
       // this schedule is shared by velocity and position modes so the outer
       // loop never switches to another actuator model near the target.
       const bool lowSpeedRequest = motionRequested &&
           fabsf(cascadeVelocityCommandDps) < 1000.0f;
-      const float lowSpeedKpFloor = 0.0060f;
+      const float lowSpeedKpFloor = cascadeVelocityLowSpeedKpFloor;
       const float effectiveVelocityKp = lowSpeedRequest
           ? max(cascadeVelocityKp, lowSpeedKpFloor) : cascadeVelocityKp;
       const float effectiveVelocityKi = lowSpeedRequest
-          ? max(cascadeVelocityKi, 0.0010f) : cascadeVelocityKi;
+          ? max(cascadeVelocityKi, cascadeVelocityLowSpeedKiFloor)
+          : cascadeVelocityKi;
       const float velocityIntegralLimit = effectiveVelocityKi > 0.0000001f
-          ? cascadeVelocityMaxCurrentA / effectiveVelocityKi
+          ? effectiveCurrentLimitA / effectiveVelocityKi
           : 10000.0f;
       float candidateIntegral = constrain(
           cascadeVelocityIntegral + velocityError * velocityDt,
@@ -1647,17 +2309,15 @@ static void cascadeControlTick() {
       const float candidateCurrent = effectiveVelocityKp * velocityError +
                                      effectiveVelocityKi * candidateIntegral +
                                      velocityFeedForward;
-      const bool saturated = (candidateCurrent > cascadeVelocityMaxCurrentA && velocityError > 0.0f) ||
-                             (candidateCurrent < -cascadeVelocityMaxCurrentA && velocityError < 0.0f);
       // Build torque quickly for a real speed step, then soften only the last
       // part of the approach. This removes the old 150-200 ms artificial
       // delay at a 1.5-2 A request without turning encoder quantisation near
       // the target into audible current chatter.
       const float configuredCurrentSlewAps =
           max(0.1f, cascadeVelocityCurrentSlewAps);
-      const float quietCurrentSlewAps = min(
-          configuredCurrentSlewAps,
-          CASCADE_VELOCITY_QUIET_CURRENT_SLEW_A_PER_S);
+      const float quietCurrentSlewAps = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
+          ? configuredCurrentSlewAps : min(configuredCurrentSlewAps,
+                                          CASCADE_VELOCITY_QUIET_CURRENT_SLEW_A_PER_S);
       const float responseBlend = constrain(
           fabsf(velocityError) / CASCADE_VELOCITY_FULL_RESPONSE_ERROR_DPS,
           0.0f, 1.0f);
@@ -1668,46 +2328,23 @@ static void cascadeControlTick() {
           effectiveVelocityKp * velocityError +
               effectiveVelocityKi * cascadeVelocityIntegral +
               velocityFeedForward,
-          -cascadeVelocityMaxCurrentA, cascadeVelocityMaxCurrentA);
-      const bool currentSlewLagging =
-          fabsf(currentBeforeIntegralA - cascadeCurrentCommandA) >
-          baseCurrentStepA * 2.0f;
-      const bool integralUnwinding =
-          cascadeVelocityIntegral * velocityError < 0.0f;
-      // Tracking anti-windup: do not store extra velocity error while the
-      // torque command itself is still slewing toward the previous request.
-      // Always permit opposite-sign error to unwind an existing integral.
-      if (!saturated && (!currentSlewLagging || integralUnwinding)) {
+          -effectiveCurrentLimitA, effectiveCurrentLimitA);
+      // On the geared motor, integration is conditioned on actual current
+      // saturation, not a heuristic slew lag. The latter repeatedly froze
+      // integration during torque ripple and left a sustained speed error.
+      const float integralTrackingCurrent = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
+          ? currentBeforeIntegralA : cascadeCurrentCommandA;
+      if (motor_control::integralAllowed(velocityError, candidateCurrent,
+              currentBeforeIntegralA, integralTrackingCurrent,
+              effectiveCurrentLimitA, baseCurrentStepA,
+              cascadeBreakawayPulseActive)) {
         cascadeVelocityIntegral = candidateIntegral;
       }
       float requestedCurrentA = constrain(
           effectiveVelocityKp * velocityError +
               effectiveVelocityKi * cascadeVelocityIntegral +
               velocityFeedForward,
-          -cascadeVelocityMaxCurrentA, cascadeVelocityMaxCurrentA);
-      // Static friction compensation is a continuous, identified feed-forward
-      // term, not another PID gain.  At zero speed the 775 needs the measured
-      // breakaway current to leave a magnetic detent; once the shaft is moving
-      // that term must fade smoothly or it becomes the source of overshoot.
-      // Gate it by the velocity error so it cannot fight the inner loop while
-      // the rotor is already faster than the requested trajectory.
-      const bool positionNeedsForwardTorque =
-          controlMode == CONTROL_POSITION &&
-          finalPositionError * cascadeVelocityCommandDps >
-              cascadePositionDeadbandDeg &&
-          velocityError * cascadeVelocityCommandDps > 0.0f &&
-          fabsf(encoderVelocityDegreesPerSecond) < 120.0f;
-      if (positionNeedsForwardTorque && cascadeVelocityFrictionA > 0.0f) {
-        const float speedBlend = constrain(
-            1.0f - fabsf(encoderVelocityDegreesPerSecond) / 120.0f,
-            0.0f, 1.0f);
-        const float staticAssistA = cascadeVelocityFrictionA *
-                                    speedBlend * speedBlend;
-        requestedCurrentA = constrain(
-            requestedCurrentA + copysignf(staticAssistA,
-                                          cascadeVelocityCommandDps),
-            -cascadeVelocityMaxCurrentA, cascadeVelocityMaxCurrentA);
-      }
+          -effectiveCurrentLimitA, effectiveCurrentLimitA);
       // At low speed the identified static-friction term may still be
       // cancelled by a small velocity-loop request.  Keep a configurable
       // minimum torque reference while the position error and velocity error
@@ -1747,7 +2384,7 @@ static void cascadeControlTick() {
         cascadeVelocityIntegral *= max(0.0f, 1.0f - 8.0f * velocityDt);
       }
       // Limit torque-command slew. Current regulation still runs at 2 kHz;
-      // this 200 Hz limiter only prevents the outer loop from commanding an
+      // this 500 Hz limiter only prevents the outer loop from commanding an
       // instantaneous multi-ampere reversal on a light rotor.
       const bool currentReversing =
           requestedCurrentA * cascadeCurrentCommandA < 0.0f;
@@ -1758,6 +2395,8 @@ static void cascadeControlTick() {
       // the target for seconds before braking becomes available.
       const float slewMultiplier =
           (currentReversing || currentReducing)
+              && (velocityError * cascadeVelocityCommandDps <= 0.0f ||
+                  fabsf(cascadeVelocityCommandDps) < 0.05f || currentReversing)
               ? cascadeVelocityBrakeSlewMultiplier : 1.0f;
       const float currentStepA = baseCurrentStepA * slewMultiplier;
       if (cascadeBreakawayPulseActive) {
@@ -1766,44 +2405,128 @@ static void cascadeControlTick() {
         // into PWM.
         cascadeCurrentCommandA = requestedCurrentA;
       } else {
-        const float releaseStepA = cascadeBreakawayPulseReleasePending
-            ? max(currentStepA, max(1.0f, fabsf(cascadeCurrentCommandA)))
-            : currentStepA;
-        cascadeCurrentCommandA += constrain(
-            requestedCurrentA - cascadeCurrentCommandA,
-            -releaseStepA, releaseStepA);
+        // No discontinuous pulse -> PI handoff. Even on the first tick after
+        // assistance the configured current slew remains authoritative.
+        const float releaseStepA = currentStepA;
+        cascadeCurrentCommandA = motor_control::slew(
+            cascadeCurrentCommandA, requestedCurrentA, releaseStepA);
         if (fabsf(requestedCurrentA) < 0.001f &&
             fabsf(cascadeCurrentCommandA) < releaseStepA) {
           cascadeCurrentCommandA = 0.0f;
         }
         cascadeBreakawayPulseReleasePending = false;
       }
+    } else if (controlMode == CONTROL_KNOB) {
+      const auto output = haptic::evaluate(knobConfig,
+          encoderMultiTurnDegrees / motorProfileGearRatio,
+          encoderVelocityDegreesPerSecond / motorProfileGearRatio, knobOriginOutputDeg);
+      if (!output.valid) {
+        motorStop();
+        Console.println("CASCADE fault knob_invalid_or_overspeed");
+        return;
+      }
+      knobCenterOutputDeg = output.centerDeg;
+      cascadeVelocityCommandDps = 0;
+      cascadeVelocityRequestedDps = 0;
+      // No legacy 2 A floor, velocity PI or rotor/friction feed-forward here.
+      // This mode represents a virtual potential + dissipative damping only.
+      // Ramp only when entering/changing an effect. Slewing every detent's
+      // torque reversal adds phase lag and can turn intended damping into
+      // an active push. The already-tuned 2 kHz current PI handles the live
+      // continuous reference directly, with the same amplitude protections.
+      const float envelope = min(1.0f, static_cast<float>(nowMs - knobRampStartedMs) / 80.0f);
+      cascadeCurrentCommandA = output.currentA * envelope;
     } else if (controlMode == CONTROL_CURRENT) {
-      cascadeCurrentCommandA = modelTargetCurrentAmps;
+      // A bilateral torque reference is not a slow manual current step.
+      // Slewing every sign reversal at 10 A/s inserts up to 320 ms at 1.6 A.
+      // Keep only the entry envelope; do not delay live braking reversals.
+      cascadeCurrentCommandA = syncMotionArmed && syncMode == SYNC_FORCE
+          ? modelTargetCurrentAmps * min(1.0f, (nowMs - syncForceStartedMs) / 80.0f)
+          : activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
+          ? motor_control::slew(cascadeCurrentCommandA, modelTargetCurrentAmps,
+                                10.0f * velocityDt)
+          : modelTargetCurrentAmps;
     }
   }
 
-  if (cascadeLastCurrentUs != 0 &&
-      nowUs - cascadeLastCurrentUs < CURRENT_LOOP_PERIOD_US) return;
+  if (!motor_control::takeDeadline(nowUs, cascadeNextCurrentUs, CURRENT_LOOP_PERIOD_US)) return;
+  const float currentMv = filterCurrentSenseMillivolts(readCurrentSenseMillivolts());
+  const uint32_t currentSampleUs = micros();
+  const uint32_t currentElapsedUs = currentSampleUs - cascadeLastCurrentUs;
   const float currentDt = cascadeLastCurrentUs == 0
       ? static_cast<float>(CURRENT_LOOP_PERIOD_US) / 1000000.0f
-      : static_cast<float>(nowUs - cascadeLastCurrentUs) / 1000000.0f;
-  cascadeLastCurrentUs = nowUs;
-  const float currentMv = filterCurrentSenseMillivolts(readCurrentSenseMillivolts());
+      : static_cast<float>(currentElapsedUs) / 1000000.0f;
+  if (cascadeLastCurrentUs) {
+    cascadeCurrentMinPeriodUs = min(cascadeCurrentMinPeriodUs, currentElapsedUs);
+    cascadeCurrentMaxPeriodUs = max(cascadeCurrentMaxPeriodUs, currentElapsedUs);
+  }
+  cascadeLastCurrentUs = currentSampleUs;
+  ++cascadeCurrentTicks;
   cascadeMeasuredCurrentA = readSignedCurrentMilliamps(currentMv) / 1000.0f;
   latestCurrentMilliamps = cascadeMeasuredCurrentA * 1000.0f;
+  const bool bilateralForce = syncMotionArmed && syncMode == SYNC_FORCE;
+  if (bilateralForce && nowMs - syncForceStartedMs >= 60000) {
+    motorStop();
+    Console.println("CONTROL_COMPLETE mode=force reason=session_end");
+    return;
+  }
+  if (controlMode == CONTROL_KNOB && fabsf(cascadeMeasuredCurrentA) > 1.2f) {
+    motorStop();
+    Console.println("CASCADE fault knob_overcurrent measured_above_1.2A");
+    return;
+  }
   if (cascadeBusVoltage < 2.0f) cascadeBusVoltage = readBusVoltage();
 
-  const float currentTarget = constrain(cascadeCurrentCommandA,
-                                        -modelCurrentLimitAmps,
-                                        modelCurrentLimitAmps);
+  const float operatingLimit = interaction::operatingCurrentLimit(modelCurrentLimitAmps);
+  float currentTarget = constrain(cascadeCurrentCommandA, -operatingLimit, operatingLimit);
+  const bool guardedCurrent = controlMode == CONTROL_CURRENT && !bilateralForce &&
+      activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM;
+  const bool guardedInteraction = bilateralForce || controlMode == CONTROL_KNOB || guardedCurrent;
+  bool interactionCoast = false;
+  if (guardedInteraction) {
+    const float reference = bilateralForce ? syncForceStartBusV :
+        guardedCurrent ? currentStartBusV : knobStartBusV;
+    const auto protection = interactionGuard.update(
+        encoderVelocityDegreesPerSecond / motorProfileGearRatio,
+        cascadeBusVoltage, reference, cascadeMeasuredCurrentA,
+        controlMode == CONTROL_KNOB ? 1.0f : modelCurrentLimitAmps, currentDt, nowMs);
+    if (protection.fault) {
+      const float faultCurrent = cascadeMeasuredCurrentA, faultPwm = cascadeSignedPwm;
+      motorStop();
+      Console.printf("CASCADE fault interaction reason=%s measured_A=%.3f limit_A=%.3f pwm=%.1f rearm_required=1\n",
+                     interaction::name(protection.reason), faultCurrent,
+                     modelCurrentLimitAmps, faultPwm);
+      return;
+    }
+    currentTarget *= protection.gain;
+    interactionEffectiveCurrentA = currentTarget;
+    interactionCoast = protection.gain <= .0001f;
+    if (protection.reason != interactionNotice ||
+        (protection.reason != interaction::Clear && nowMs-interactionNoticeAtMs >= 1000)) {
+      interactionNotice = protection.reason;
+      interactionNoticeAtMs = nowMs;
+      Console.printf("CONTROL_WARN reason=%s gain=%.3f output_dps=%.2f bus=%.2f current_A=%.3f\n",
+                     interaction::name(protection.reason), protection.gain,
+                     encoderVelocityDegreesPerSecond/motorProfileGearRatio,
+                     cascadeBusVoltage, cascadeMeasuredCurrentA);
+    }
+  }
+  if (currentTraceCount < currentTraceLimit) {
+    const uint32_t traceNowUs = micros();
+    currentTrace[currentTraceCount++] = {
+        static_cast<uint64_t>(esp_timer_get_time()) - static_cast<uint32_t>(traceNowUs-currentSampleUs),
+        currentTarget, cascadeMeasuredCurrentA, cascadeSignedPwm,
+        encoderMultiTurnDegrees, encoderVelocityDegreesPerSecond,
+        static_cast<uint32_t>(traceNowUs-encoderPreviousSampleUs), cascadeBusVoltage};
+  }
   // A zero current reference means high impedance/coast for this sign-
   // magnitude bridge. Do not use a reverse voltage pulse to cancel the
   // measured current left by a just-finished breakaway pulse; that pulse was
   // the reason a nominally positive 2 deg move first jumped negative.
   // Explicit opposite-sign current from the velocity/position loop still
   // reaches the current regulator and is allowed to brake the rotor.
-  if (fabsf(currentTarget) < 0.005f) {
+  const bool continuousCurrent = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM;
+  if (interactionCoast || (!continuousCurrent && fabsf(currentTarget) < 0.005f)) {
     cascadeCurrentIntegral = 0.0f;
     cascadeSignedPwm = 0.0f;
     applyCascadeBridgePwm(0.0f);
@@ -1818,7 +2541,9 @@ static void cascadeControlTick() {
   // once it is near zero, the normal signed current PI takes over.  This is a
   // bumpless sign transition, not a reduction of the normal 0..4095 duty
   // range or of the configured current limit.
-  if (cascadeMeasuredCurrentA * currentTarget < 0.0f &&
+  // A signed current regulator must retain braking authority across zero.
+  // The old 775 coast interlock is NOT part of the 36GP current controller.
+  if (!continuousCurrent && cascadeMeasuredCurrentA * currentTarget < 0.0f &&
       fabsf(cascadeMeasuredCurrentA) > 0.08f) {
     cascadeCurrentIntegral = 0.0f;
     cascadeSignedPwm = 0.0f;
@@ -1826,24 +2551,50 @@ static void cascadeControlTick() {
     return;
   }
   const float currentError = currentTarget - cascadeMeasuredCurrentA;
+  // Do not integrate missed cycles using one newly sampled error. USB/bus
+  // scheduling delays must not produce an integral catch-up voltage kick.
+  const float integrationDt = interaction::integrationStep(currentDt,
+      static_cast<float>(CURRENT_LOOP_PERIOD_US) / 1000000.0f);
   const float candidateIntegral = constrain(
-      cascadeCurrentIntegral + currentError * currentDt, -5.0f, 5.0f);
+      cascadeCurrentIntegral + currentError * integrationDt, -5.0f, 5.0f);
   const float omega = encoderVelocityDegreesPerSecond * 0.01745329252f;
+  // Two-degree-of-freedom PI for 36GP: model voltage supplies the setpoint,
+  // P acts on measurement (beta=0), and I regulates true target-minus-current.
+  // This avoids adding a proportional setpoint kick on top of R*I feedforward
+  // while retaining the fast reference path needed by the velocity loop.
+  const float proportionalError = continuousCurrent ? -cascadeMeasuredCurrentA : currentError;
   const float feedforwardVoltage = modelResistanceOhm * currentTarget +
                                    modelKeVoltSecondsPerRad * omega;
   const float feedforwardPwm = feedforwardVoltage /
                                max(2.0f, cascadeBusVoltage) * PWM_MAX;
-  const float candidatePwm = feedforwardPwm + cascadeCurrentKp * currentError +
+  const float candidatePwm = feedforwardPwm + cascadeCurrentKp * proportionalError +
                              cascadeCurrentKi * candidateIntegral;
-  const float pwmLimit = min(static_cast<float>(modelMaxDuty),
-                             cascadeCurrentMaxPwm);
-  const bool saturated = (candidatePwm > pwmLimit && currentError > 0.0f) ||
-                         (candidatePwm < -pwmLimit && currentError < 0.0f);
+  const float pwmLimit = min(
+      min(static_cast<float>(modelMaxDuty), cascadeCurrentMaxPwm),
+      static_cast<float>(motorProfileVoltageDutyLimit(cascadeBusVoltage)));
+  // Model-based voltage envelope supplements measured-current PI. Preserve
+  // signed braking authority and back-EMF compensation, without coast/rearm.
+  // R/Ke uncertainty means this is not a hardware current guarantee.
+  const float emf = modelKeVoltSecondsPerRad * omega;
+  // Preserve the user-accepted direct-current/haptic path. Position/velocity
+  // need measured-current PI authority beyond this unvalidated model envelope.
+  const bool useModelEnvelope = continuousCurrent &&
+      controlMode != CONTROL_POSITION && controlMode != CONTROL_VELOCITY;
+  const float lowerPwm = useModelEnvelope && cascadeMeasuredCurrentA <= operatingLimit ? interaction::currentVoltageBound(
+      emf, modelResistanceOhm, -operatingLimit, cascadeBusVoltage, pwmLimit) : -pwmLimit;
+  const float upperPwm = useModelEnvelope && cascadeMeasuredCurrentA >= -operatingLimit ? interaction::currentVoltageBound(
+      emf, modelResistanceOhm, operatingLimit, cascadeBusVoltage, pwmLimit) : pwmLimit;
+  const bool saturated = (candidatePwm > upperPwm && currentError > 0.0f) ||
+                         (candidatePwm < lowerPwm && currentError < 0.0f);
   if (!saturated) cascadeCurrentIntegral = candidateIntegral;
   float requestedPwm =
-      feedforwardPwm + cascadeCurrentKp * currentError +
+      feedforwardPwm + cascadeCurrentKp * proportionalError +
           cascadeCurrentKi * cascadeCurrentIntegral;
-  cascadeSignedPwm = constrain(requestedPwm, -pwmLimit, pwmLimit);
+  cascadeSignedPwm = constrain(requestedPwm, lowerPwm, upperPwm);
+  if (continuousCurrent && cascadeCurrentKi > 0.0f && cascadeSignedPwm != requestedPwm) {
+    cascadeCurrentIntegral = constrain((cascadeSignedPwm-feedforwardPwm-
+        cascadeCurrentKp*proportionalError)/cascadeCurrentKi, -5.0f, 5.0f);
+  }
   applyCascadeBridgePwm(cascadeSignedPwm);
   // A successful USB command is not proof that the power stage is working.
   // In direct-current commissioning mode, full bridge demand with no branch
@@ -1876,7 +2627,7 @@ static void cascadeControlTick() {
   }
   if (nowMs - lastPositionDebugMs >= 100) {
     lastPositionDebugMs = nowMs;
-    Console.printf("CASCADE mode=%s pos=%.2f/%.2f vel=%.1f/%.1f current=%.3f/%.3f pwm=%.1f loops=2000/500(position)/200(outer)/100(stream)Hz\n",
+    Console.printf("CASCADE mode=%s pos=%.2f/%.2f vel=%.1f/%.1f current=%.3f/%.3f pwm=%.1f loops=current:2000 velocity:500 position:200 stream:100Hz\n",
                   controlModeName(), encoderMultiTurnDegrees,
                   modelTargetPositionDegrees, encoderVelocityDegreesPerSecond,
                   cascadeVelocityCommandDps, cascadeMeasuredCurrentA,
@@ -1906,7 +2657,8 @@ static void finishIdentification(bool success) {
 static void identificationTick() {
   if (!identificationRunActive) return;
   const uint32_t now = millis();
-  if (!driverAwake || digitalRead(PIN_NFAULT) == LOW || readBusVoltage() < 2.0f) {
+  if (!driverAwake || digitalRead(PIN_NFAULT) == LOW ||
+      !driverSupplyValid(readBusVoltage())) {
     finishIdentification(false);
     return;
   }
@@ -1914,7 +2666,7 @@ static void identificationTick() {
     ++identificationPhase;
     identificationPhaseUntilMs = 0;
     if (identificationPhase >= 8) {
-      finishIdentification(modelElectricalSamples >= 20);
+      finishIdentification(modelHasElectricalFit || modelHasMechanicalFit);
       return;
     }
   }
@@ -1924,10 +2676,21 @@ static void identificationTick() {
     // open-ended spin command. STOP aborts the sequence immediately.
     static const uint16_t duties[] = {0, 180, 0, 180, 0, 320, 0, 320};
     static const uint16_t durations[] = {250, 350, 100, 350, 100, 450, 100, 450};
-    if (identificationPhase >= 8) { finishIdentification(modelElectricalSamples >= 20); return; }
+    if (identificationPhase >= 8) {
+      finishIdentification(modelHasElectricalFit || modelHasMechanicalFit);
+      return;
+    }
     const bool forward = identificationPhase == 1 || identificationPhase == 3 || identificationPhase == 5;
+    // The 36GP-555 is geared and the MT6701 is on its rear motor shaft. Give
+    // Ke identification enough voltage/speed excitation to be observable,
+    // while keeping the bounded run below the driver's normal envelope.
+    const bool geared24VProfile = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM;
+    const uint16_t duty = geared24VProfile
+        ? (identificationPhase == 1 || identificationPhase == 3 ? 240
+           : identificationPhase == 5 || identificationPhase == 7 ? 720 : 0)
+        : duties[identificationPhase];
     setModelPhase(forward ? 1.0f : -1.0f);
-    setPwm(duties[identificationPhase]);
+    setPwm(duty);
     identificationPhaseUntilMs = now + durations[identificationPhase];
   }
   uint16_t raw = 0;
@@ -2117,15 +2880,10 @@ static void streamTick() {
   if (!streamEnabled) return;
   const uint32_t nowUs = micros();
   const uint32_t periodUs = max<uint32_t>(1000, 1000000u / streamRateHz);
-  if (nextStreamAtUs != 0 && static_cast<int32_t>(nowUs - nextStreamAtUs) < 0) return;
-  // Advance from the previous deadline instead of adding the period to the
-  // current time, so USB/ADC work does not accumulate scheduling drift.
-  if (nextStreamAtUs == 0 || static_cast<int32_t>(nowUs - nextStreamAtUs) >
-                              static_cast<int32_t>(periodUs * 4u)) {
-    nextStreamAtUs = nowUs + periodUs;
-  } else {
-    nextStreamAtUs += periodUs;
-  }
+  if (!motor_control::takeDeadline(nowUs, nextStreamAtUs, periodUs)) return;
+  // A blocked host must not queue seconds of obsolete telemetry ahead of
+  // STOP/fault acknowledgements. Keep at most a few complete sample lines.
+  if (Console.pendingBytes() > 512) { ++telemetryDroppedFrames; return; }
   // Reuse the sample accepted by the idle tracker or the active controller.
   // A second immediate I2C read here would have almost zero delta and would
   // drag the shared velocity filter toward zero every 10 ms.
@@ -2146,8 +2904,10 @@ static void streamTick() {
   // velocity,control,target,phase,pwm_signed,pid_raw,pid_applied,stall_boost,
   // settled,velocity_target,current_target_ma,current_measured_ma,cascade_pwm,
   // raw_velocity_dps.
-  Console.printf("S,%lu,%.2f,%.2f,%.2f,%.0f,%u,%d,%d,%u,%u,%.1f,%u,%.2f,%d,%d,%.1f,%.1f,%.1f,%d,%.1f,%.0f,%.0f,%.1f,%.1f\n",
-                static_cast<unsigned long>(nowUs / 1000u), singleTurnDegrees, encoderMultiTurnDegrees,
+  // Do not divide 32-bit micros(): its 71-minute wrap looked like a reboot
+  // to the browser and invalidated position-hold leases during long sessions.
+  Console.printf("S,%llu,%.2f,%.2f,%.2f,%.0f,%u,%d,%d,%u,%u,%.1f,%u,%.2f,%d,%d,%.1f,%.1f,%.1f,%d,%.1f,%.0f,%.0f,%.1f,%.1f,%.2f,%u\n",
+                static_cast<unsigned long long>(esp_timer_get_time() / 1000), singleTurnDegrees, encoderMultiTurnDegrees,
                 busV, currentMa, static_cast<unsigned>(pwmDuty()), digitalRead(PIN_NFAULT),
                 driverAwake ? 1 : 0, static_cast<unsigned>(currentStep), raw,
                 encoderVelocityDegreesPerSecond, static_cast<unsigned>(controlMode),
@@ -2155,12 +2915,23 @@ static void streamTick() {
                 static_cast<int>(signedPwmDuty()), latestPositionPidRawPwm,
                 latestPositionPidAppliedPwm, positionPidStallBoostPwm,
                 cascadePositionSettled ? 1 : 0, cascadeVelocityCommandDps,
-                cascadeCurrentCommandA * 1000.0f,
-                cascadeMeasuredCurrentA * 1000.0f, cascadeSignedPwm,
-                encoderRawVelocityDegreesPerSecond);
+                ((controlMode == CONTROL_CURRENT || controlMode == CONTROL_KNOB) &&
+                  activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
+                    ? interactionEffectiveCurrentA : cascadeCurrentCommandA) * 1000.0f,
+                currentMa, cascadeSignedPwm,
+                encoderRawVelocityDegreesPerSecond, modelTargetPositionDegrees,
+                syncMotionArmed && syncMode == SYNC_FORCE ? 1u : 0u);
 }
 
 static void setDriverAwake(bool awake) {
+  if (awake && !Console.ready()) {
+    motorStop();
+    digitalWrite(PIN_NSLEEP, LOW);
+    digitalWrite(PIN_NRESET, LOW);
+    driverAwake = false;
+    Console.println("ERR usb_worker_unavailable; driver remains disabled");
+    return;
+  }
   // WAKE is a state-setting command, not a destructive reset command. The
   // web server and UI can both request readiness; making an already-awake
   // WAKE call motorStop() used to cancel a motion that had just started.
@@ -2314,7 +3085,9 @@ static void syncSendState(uint8_t kind) {
                                  : 0.0f;
   payload.pwm = pwmDuty();
   payload.fault = digitalRead(PIN_NFAULT) ? 1 : 0;
-  payload.awake = driverAwake ? 1 : 0;
+  // A stopped peer can still answer DATA requests. Hardware awake alone
+  // must NOT advertise torque readiness after its controller disarms.
+  payload.awake = driverAwake && syncMotionArmed ? 1 : 0;
   busSendFrame(syncPeerAddress, BUS_TYPE_SYNC, ++syncSequence,
                reinterpret_cast<const uint8_t *>(&payload), sizeof(payload));
   syncLastTxUs = payload.timestampUs;
@@ -2342,7 +3115,7 @@ static void syncApplyRemoteState() {
       // armed. A hard motorStop() used to disarm both nodes permanently at the
       // first 30 ms burst of motor EMI, so the requester stopped transmitting
       // and the link could never recover after the bridge went quiet.
-      const bool keepSyncArmed = syncMotionArmed;
+      const bool keepSyncArmed = syncMotionArmed && syncMode != SYNC_FORCE;
       motorStop();
       syncMotionArmed = keepSyncArmed;
       syncControlRunning = false;
@@ -2394,12 +3167,13 @@ static void syncApplyRemoteState() {
     // remote branch current for a bilateral force-feedback experiment.
     // Remote motor current is the torque exerted by that motor. The reaction
     // felt by the peer has the opposite sign, hence the subtraction below.
-    // With reflection=0 this remains a passive virtual spring-damper pair.
+    // A delayed, sampled coupling is NOT guaranteed passive by reflection=0.
     const float commandedMa = syncStiffnessMaPerDeg * positionError +
                               syncDampingMaPerDps * velocityError -
                               syncReflectionGain * syncRemoteCurrentMa;
-    const float limitedMa = constrain(commandedMa, -syncCurrentLimitMa,
-                                      syncCurrentLimitMa);
+    const float forceCeilingMa = min(syncCurrentLimitMa,
+        interaction::operatingCurrentLimit(modelCurrentLimitAmps) * 1000.0f);
+    const float limitedMa = constrain(commandedMa, -forceCeilingMa, forceCeilingMa);
     if (!syncControlRunning || controlMode != CONTROL_CURRENT) {
       setCurrentStep(3);
       resetCascadeController();
@@ -2639,7 +3413,8 @@ static void busProcessByte(uint8_t byte) {
 }
 
 static void busProcessRx() {
-  while (BusSerial.available()) {
+  // A continuous DATA sender must not monopolize the control task.
+  for (unsigned budget = 0; budget < 128 && BusSerial.available(); ++budget) {
     busProcessByte(static_cast<uint8_t>(BusSerial.read()));
   }
 }
@@ -2682,6 +3457,7 @@ static void busHandleCommand(uint8_t source, uint8_t sequence, uint8_t destinati
   if (command == "wake") {
     const bool resetPerformed = !driverAwake;
     setDriverAwake(true);
+    if (!driverAwake) { reply("usb_worker_unavailable", false); return; }
     reply(String("awake=1 pwm=") + String(pwmDuty()) +
           " reset=" + String(resetPerformed ? 1 : 0));
     return;
@@ -2715,8 +3491,8 @@ static bool parseUInt(const String &s, int &value) {
 }
 
 static void printHelp() {
-  Console.println("Commands: help | status | diag | dctest cw|ccw 1..200 | encoder | encreset | rawadc | model | cascade status|current KP KI MAX_PWM|velocity KP KI MAX_A|low_speed_current A|breakaway CURRENT_A MAX_MS RETRY_MS SPEED_DPS [RAMP_A_PER_S]|position KP KI KD MAX_DPS DEAD|trajectory MAX_DPS ACCEL_DPS2 JERK_DPS3 BANDWIDTH | pospid ... | direction normal|invert | sensepolarity normal|invert | identify on|off|reset|start | current mA D MS | velocity DPS D MS | pos MULTI_DEG D MS | businfo | busbaud 115200|250000|500000|750000|1000000 | busaddr 1..254 | bus ADDR ... | sync ... | wake | sleep | stop | stream 1..100|off | cw D MS | ccw D MS | setstep 0..3 | decay slow|fast | led on|off");
-  Console.println("D=0..4095 (0..100%), MS=1..30000. Cascade rates: current=2000 Hz, position velocity=500 Hz, position=200 Hz, USB stream=100 Hz. Position output is velocity; velocity output is current; current output is PWM.");
+  Console.println("Commands: help | status | diag | motorprofile status|775|25ga370|36gp555 | dctest cw|ccw 1..200 | encoder | encreset | rawadc | model | cascade status|current KP KI MAX_PWM|velocity KP KI MAX_A|low_speed_current A|breakaway CURRENT_A MAX_MS RETRY_MS SPEED_DPS [RAMP_A_PER_S]|position KP KI KD MAX_DPS DEAD|trajectory MAX_DPS ACCEL_DPS2 JERK_DPS3 BANDWIDTH | pospid ... | direction normal|invert | sensepolarity normal|invert | identify on|off|reset|start | current mA D MS | velocity DPS D MS | pos MULTI_DEG D MS | businfo | busbaud 115200|250000|500000|750000|1000000 | busaddr 1..254 | bus ADDR ... | sync ... | wake | sleep | stop | stream 1..100|off | cw D MS | ccw D MS | setstep 0..3 | decay slow|fast | led on|off");
+  Console.println("D=0..4095 (0..100%), MS=1..30000. Cascade rates: current=2000 Hz, velocity=500 Hz, position=200 Hz, USB stream=100 Hz. Position output is velocity; velocity output is current; current output is PWM.");
 }
 
 static void handleCommand(String cmd) {
@@ -2728,7 +3504,8 @@ static void handleCommand(String cmd) {
   rest.trim();
 
   const bool requestsMotion = op == "dctest" || op == "lapatest" ||
-      op == "current" || op == "velocity" || op == "vel" || op == "pos" ||
+      op == "current" || op == "velocity" || op == "vel" || op == "pos" || op == "posout" ||
+      (op == "knob" && (rest.startsWith("start ") || rest.startsWith("keep "))) ||
       op == "cw" || op == "ccw" || op == "identify" ||
       (op == "sync" && rest != "off" && rest != "stop" &&
        rest != "disarm" && rest != "status");
@@ -2736,8 +3513,105 @@ static void handleCommand(String cmd) {
     Console.println("ERR power_path_fault_latched; inspect motor output/current sense then run recover");
     return;
   }
+  if (requestsMotion && pwmConfiguredHz <= 0) {
+    Console.println("ERR pwm_not_configured; run recover and check DIAG pwm_ok=1");
+    return;
+  }
 
-  if (op == "help") {
+  if (op == "trace") {
+    if (modelControlActive || pwmDuty() != 0) {
+      Console.println("ERR trace commands require STOP first");
+      return;
+    }
+    if (rest.startsWith("arm ")) {
+      int count = 0;
+      if (sscanf(rest.c_str(), "arm %d", &count) != 1 || count < 10 || count > 1024) {
+        Console.println("ERR trace arm N(10..1024)");
+        return;
+      }
+      currentTraceCount = 0;
+      currentTraceLimit = count;
+      currentTraceDumping = false;
+      Console.printf("OK trace_armed samples=%d next_motion_only=1\n", count);
+    } else if (rest == "dump") {
+      currentTraceLimit = 0;
+      currentTraceDumpIndex = 0;
+      currentTraceDumping = true;
+      Console.printf("TRACE_META count=%u fields=us,reference_A,measured_A,prior_pwm,rotor_deg,rotor_dps,encoder_age_us,bus_V\n",
+                     static_cast<unsigned>(currentTraceCount));
+    } else {
+      Console.println("ERR trace arm N|dump");
+    }
+  } else if (op == "knob") {
+    if (rest == "stop") {
+      motorStop();
+      Console.println("OK knob_stop pwm=0");
+    } else if (rest == "status") {
+      Console.printf("KNOB_CFG active=%d effect=%d spacing_out_deg=%.3f peak_mA=%.1f damping_mA_per_out_dps=%.3f range_out_deg=%.3f origin_out_deg=%.4f limit_mA=600 lease_ms=1000 session_ms=60000\n",
+          controlMode == CONTROL_KNOB ? 1 : 0, knobConfig.effect, knobConfig.spacingDeg,
+          knobConfig.strengthA * 1000, knobConfig.dampingAperDps * 1000,
+          knobConfig.rangeDeg, knobOriginOutputDeg);
+    } else if (rest.startsWith("config ")) {
+      haptic::Config next;
+      float peakMa = 0, dampingMa = 0;
+      char extra = 0;
+      if (sscanf(rest.c_str(), "config %d %f %f %f %f %c", &next.effect,
+          &next.spacingDeg, &peakMa, &dampingMa, &next.rangeDeg, &extra) != 5) {
+        Console.println("ERR knob config EFFECT(0..3) SPACING_OUT_DEG(2..90) PEAK_MA(0..600) DAMPING_MA_PER_OUT_DPS(0..10) RANGE_OUT_DEG(SPACING..720)");
+        return;
+      }
+      next.strengthA = peakMa / 1000; next.dampingAperDps = dampingMa / 1000;
+      if (!haptic::valid(next)) { Console.println("ERR knob config outside limits"); return; }
+      knobConfig = next;  // Configuration never arms or renews the lease.
+      knobRampStartedMs = millis();
+      Console.println("OK knob_config");
+    } else if (rest.startsWith("start ") || rest.startsWith("keep ")) {
+      const bool starting = rest.startsWith("start ");
+      int token = 0;
+      if (!parseUInt(rest.substring(starting ? 6 : 5), token) || token <= 0 || token > 1000000000) {
+        Console.println("ERR knob invalid session token"); return;
+      }
+      if (!starting) {
+        if (controlMode != CONTROL_KNOB || !knobLease.keep(token, millis())) {
+          Console.println("ERR knob lease expired or wrong session; explicitly start again"); return;
+        }
+        Console.printf("OK knob_keep token=%d active=1\n", token);
+        return;
+      }
+      if (modelControlActive || pwmDuty() != 0 || syncMotionArmed) {
+        Console.println("ERR knob start requires STOP first"); return;
+      }
+      if (activeMotorProfile != MOTOR_PROFILE_36GP555_24V_1538RPM) {
+        Console.println("ERR knob requires commissioned 36gp555 current-loop profile"); return;
+      }
+      if (!driverAwake || digitalRead(PIN_NFAULT) == LOW) {
+        Console.println("ERR knob driver asleep or nFAULT low"); return;
+      }
+      const float busV = readBusVoltage();
+      if (!driverSupplyValid(busV)) { printDriverSupplyError("knob", busV); return; }
+      uint16_t raw = 0; float angle = 0;
+      if (!readEncoder(raw, angle) || !std::isfinite(motorProfileGearRatio) || motorProfileGearRatio < 1 ||
+          fabsf(encoderVelocityDegreesPerSecond / motorProfileGearRatio) > 30) {
+        Console.println("ERR knob requires valid stationary encoder (<30 output_deg/s)"); return;
+      }
+      resetCascadeController();
+      setCurrentStep(3);
+      knobOriginOutputDeg = encoderMultiTurnDegrees / motorProfileGearRatio;
+      knobCenterOutputDeg = knobOriginOutputDeg;
+      modelMaxDuty = min<uint16_t>(cascadeCurrentMaxPwm, motorProfileVoltageDutyLimit(busV));
+      modelStopAtMs = 0; // Dedicated non-revivable 1 s lease + 60 s hard cap.
+      knobLease.start(token, millis());
+      knobStartBusV = busV;
+      interactionGuard = interaction::Guard{};
+      knobRampStartedMs = millis();
+      modelIdentificationEnabled = false; // Hand forces are not motor-identification data.
+      controlMode = CONTROL_KNOB;
+      modelControlActive = true;
+      Console.printf("OK knob_start token=%d origin_out_deg=%.5f\n", token, knobOriginOutputDeg);
+    } else {
+      Console.println("ERR knob config|start TOKEN|keep TOKEN|stop|status");
+    }
+  } else if (op == "help") {
     printHelp();
   } else if (op == "status") {
     printStatus();
@@ -2753,6 +3627,60 @@ static void handleCommand(String cmd) {
                   bridgeDriveMode == DRIVE_LOCKED_ANTIPHASE ? "locked" : "sign",
                   lockedAntiphaseActive ? 1 : 0,
                   powerPathFaultLatched ? 1 : 0);
+  } else if (op == "motorset") {
+    float voltage = 0, current = 0, gear = 0;
+    char extra;
+    const float ceiling = activeMotorProfile == MOTOR_PROFILE_775 ? BOARD_CURRENT_LIMIT_A : 2.0f;
+    if (sscanf(rest.c_str(), "%f %f %f %c", &voltage, &current, &gear, &extra) != 3 ||
+        !isfinite(voltage) || voltage < 3 || voltage > 24 ||
+        !isfinite(current) || current < 0.1f || current > ceiling ||
+        !isfinite(gear) || gear < 1 || gear > 1000) {
+      Console.println("ERR motorset rated_V=3..24 max_A=0.1..profile_limit gear=1..1000");
+      return;
+    }
+    if (modelControlActive || pwmDuty() != 0 || syncMotionArmed || driverAwake) {
+      Console.println("ERR motorset requires stop and sleep");
+      return;
+    }
+    Preferences preferences;
+    if (!preferences.begin(motorModelNamespace(), false)) {
+      Console.println("ERR motorset storage unavailable"); return;
+    }
+    const bool stored = preferences.putFloat("rated_v", voltage) == sizeof(float) &&
+        preferences.putFloat("max_a", current) == sizeof(float) &&
+        preferences.putFloat("gear", gear) == sizeof(float);
+    preferences.end();
+    if (!stored) { Console.println("ERR motorset storage incomplete"); return; }
+    loadMotorSettings();
+    modelHasElectricalFit = false;
+    modelHasMechanicalFit = false;
+    saveMotorModel();
+    resetCascadeController();
+    Console.printf("OK motorset rated_voltage=%.3f current_limit=%.3f gear=%.4f identification_required=1\n", voltage, current, gear);
+    printMotorProfile();
+  } else if (op == "motorprofile") {
+    if (rest == "status" || rest.length() == 0) {
+      printMotorProfile();
+      return;
+    }
+    MotorProfileId requestedProfile;
+    if (rest == "775") requestedProfile = MOTOR_PROFILE_775;
+    else if (rest == "25ga370") requestedProfile = MOTOR_PROFILE_25GA370_6V_620RPM;
+    else if (rest == "36gp555") requestedProfile = MOTOR_PROFILE_36GP555_24V_1538RPM;
+    else {
+      Console.println("ERR usage: motorprofile status|775|25ga370|36gp555");
+      return;
+    }
+    motorStop();
+    activeMotorProfile = requestedProfile;
+    saveMotorProfileSelection();
+    applyMotorProfileDefaults();
+    resetMotorModel();
+    loadMotorModel();
+    loadMotorSettings();
+    Console.printf("OK motorprofile=%s pwm=0 controller_defaults_loaded=1\n",
+                   motorProfileName());
+    printMotorProfile();
   } else if (op == "dctest") {
     char direction[4] = {};
     int duration = 0;
@@ -2785,7 +3713,7 @@ static void handleCommand(String cmd) {
                   bridgeDriveMode == DRIVE_LOCKED_ANTIPHASE ? "phase_50pct" : "enbl_0pct");
   } else if (op == "cascade") {
     if (rest == "status") {
-      Console.printf("CASCADE_CFG current_hz=2000 kp=%.3f ki=%.3f max_pwm=%.0f velocity_hz=200 kp=%.6f ki=%.6f max_current=%.3fA friction=%.3fA current_slew=%.2fA/s brake_slew_x=%.1f position_velocity_hz=500 position_hz=200 kp=%.3f ki=%.3f kd=%.3f max_velocity=%.1f acceleration=%.1f jerk=%.1f bandwidth=%.2f deadband=%.2f low_speed_current=%.3fA breakaway=%.3fA/%.1fms retry=%.1fms speed=%.1fdeg/s ramp=%.1fA/s\n",
+      Console.printf("CASCADE_CFG current_hz=2000 kp=%.3f ki=%.3f max_pwm=%.0f velocity_hz=500 kp=%.6f ki=%.6f max_current=%.3fA friction=%.3fA current_slew=%.2fA/s brake_slew_x=%.1f position_hz=200 kp=%.3f ki=%.3f kd=%.3f max_velocity=%.1f acceleration=%.1f jerk=%.1f bandwidth=%.2f deadband=%.2f low_speed_current=%.3fA breakaway=%.3fA/%.1fms retry=%.1fms speed=%.1fdeg/s ramp=%.1fA/s\n",
                     cascadeCurrentKp, cascadeCurrentKi, cascadeCurrentMaxPwm,
                     cascadeVelocityKp, cascadeVelocityKi,
                     cascadeVelocityMaxCurrentA, cascadeVelocityFrictionA,
@@ -2801,17 +3729,129 @@ static void handleCommand(String cmd) {
                     cascadeBreakawayPulseCurrentA, cascadeBreakawayPulseMs,
                     cascadeBreakawayRetryMs, cascadeBreakawayPulseSpeedDps,
                     cascadeBreakawayRampAps);
+      Console.printf("CONTROL_STATS ticks_i=%lu ticks_v=%lu ticks_p=%lu encoder_max_gap_us=%lu hold=%d pwm_bits=%u pwm_hz=%.1f usb_dropped=%lu\n",
+                     static_cast<unsigned long>(cascadeCurrentTicks),
+                     static_cast<unsigned long>(cascadeVelocityTicks),
+                     static_cast<unsigned long>(cascadePositionTicks),
+                     static_cast<unsigned long>(cascadeMaxEncoderGapUs),
+                     cascadePositionHoldEnabled ? 1 : 0,
+                     static_cast<unsigned>(PWM_BITS), pwmConfiguredHz,
+                     static_cast<unsigned long>(Console.droppedBytes()));
+      Console.printf("LINK_STATS encoder_reads=%lu nack=%lu short=%lu rejected=%lu read_max_us=%lu loop_max_gap_us=%lu tx_pending=%u tx_stall_ms=%lu stream_dropped=%lu usb_recoveries=%lu command_age_ms=%lu\n",
+                     static_cast<unsigned long>(encoderReadCount),
+                     static_cast<unsigned long>(encoderNacks),
+                     static_cast<unsigned long>(encoderShortReads),
+                     static_cast<unsigned long>(encoderRejectedJumps),
+                     static_cast<unsigned long>(encoderReadMaxUs),
+                     static_cast<unsigned long>(loopMaxGapUs),
+                     static_cast<unsigned>(Console.pendingBytes()),
+                     static_cast<unsigned long>(Console.stalledMs()),
+                     static_cast<unsigned long>(telemetryDroppedFrames),
+                     static_cast<unsigned long>(usbRecovery.count),
+                     static_cast<unsigned long>(millis() - usbLastCommandMs));
+      Console.printf("ADC_STATS burst_max_us=%lu cached_calibration=%d\n",
+                     static_cast<unsigned long>(adcReadMaxUs), adcCalibrationReady ? 1 : 0);
+      Console.printf("CONTROL_FILTERS deadline_skip_missed=1 current_active_tau_us=1522.05 velocity_window_us=%u raw_velocity_in_stream=1\n",
+          activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM ? 4000u : 0u);
+      Console.printf("CURRENT_TIMING sample_min_us=%lu sample_max_us=%lu trace_clock=sample_complete\n",
+          static_cast<unsigned long>(cascadeCurrentMinPeriodUs == UINT32_MAX ? 0 : cascadeCurrentMinPeriodUs),
+          static_cast<unsigned long>(cascadeCurrentMaxPeriodUs));
+      Console.printf("WATCHDOG_CFG loop=%d timeout_ms=1000 reset_reason=%d\n",
+                     loopWatchdogReady ? 1 : 0, static_cast<int>(esp_reset_reason()));
+      Console.printf("USB_RECOVERY boot_from_tx_stall=%d previous_stall_ms=%lu retry_flushes=%lu count=%lu limit=2\n",
+                     bootWasUsbRecovery ? 1 : 0,
+                     static_cast<unsigned long>(usbRecovery.stallMs),
+                     static_cast<unsigned long>(Console.retryFlushes()),
+                     static_cast<unsigned long>(usbRecovery.count));
+      Console.printf("USB_TX_STATS serialized=%d ready=%d callbacks=%lu service_max_us=%lu dropped_frames=%lu disconnects=%lu rx_rejected=%lu\n",
+                     ARDUINO_USB_CDC_ON_BOOT && !ARDUINO_USB_MODE, Console.ready() ? 1 : 0,
+                     static_cast<unsigned long>(Console.callbacks()),
+                     static_cast<unsigned long>(Console.maxServiceUs()),
+                     static_cast<unsigned long>(Console.droppedFrames()),
+                     static_cast<unsigned long>(Console.disconnects()),
+                     static_cast<unsigned long>(usbRejectedCommands));
+      const auto dcdStats = usbDcdGuardStats();
+      Console.printf("USB_DCD_GUARD installed=%d irq_calls=%lu xfer_calls=%lu irq_max_us=%lu xfer_max_us=%lu\n",
+                     dcdStats.installed ? 1 : 0, static_cast<unsigned long>(dcdStats.irqCalls),
+                     static_cast<unsigned long>(dcdStats.transferCalls),
+                     static_cast<unsigned long>(dcdStats.irqMaxUs),
+                     static_cast<unsigned long>(dcdStats.transferMaxUs));
+      Console.printf("COGGING_CFG scale=%.3f coulomb=%.4fA offset=%.4fA calibrated=%d limit=0.3A coordinate=raw_encoder\n",
+                     rotorComp.scale, rotorComp.coulombA, rotorComp.offsetA, rotorComp.scale>0 ? 1 : 0);
+    } else if (rest.startsWith("cogging ")) {
+      if (modelControlActive || pwmDuty() != 0 || activeMotorProfile != MOTOR_PROFILE_36GP555_24V_1538RPM) {
+        Console.println("ERR cogging configuration requires STOP and 36gp555 profile");
+        return;
+      }
+      RotorCompensation candidate = rotorComp;
+      int k=0; float a=0,b=0,scale=0;
+      if (rest == "cogging clear") candidate = RotorCompensation{};
+      else if (sscanf(rest.c_str(), "cogging harmonic %d %f %f", &k,&a,&b)==3 && k>=1 && k<=ROTOR_HARMONICS) {
+        candidate.harmonic[k-1][0]=a; candidate.harmonic[k-1][1]=b;
+      } else if (sscanf(rest.c_str(), "cogging enable %f %f %f", &scale,&a,&b)==3) {
+        candidate.scale=scale; candidate.coulombA=a; candidate.offsetA=b;
+      } else if (rest == "cogging save") {
+        Preferences p;
+        const bool opened=p.begin("rotor_load",false);
+        const bool saved=opened && p.putBytes("36gp",&rotorComp,sizeof(rotorComp))==sizeof(rotorComp);
+        if (opened) p.end();
+        Console.println(saved ? "OK cascade_cogging saved=1" : "ERR cogging NVS write failed");
+        return;
+      } else { Console.println("ERR cogging clear|harmonic K SIN_A COS_A|enable SCALE COULOMB_A OFFSET_A|save"); return; }
+      if (!rotorCompensationValid(candidate)) { Console.println("ERR cogging parameter range/nonfinite"); return; }
+      rotorComp=candidate;
+      if (!rest.startsWith("cogging harmonic ")) rebuildRotorTable();
+      Console.printf("OK cascade_cogging scale=%.3f harmonic=%d\n",rotorComp.scale,k);
+    } else if (rest == "hold on" || rest == "hold off") {
+      cascadePositionHoldEnabled = rest == "hold on";
+      // Setting alone never re-energises a released move; send a new target.
+      Console.printf("OK cascade_hold=%d next_target_applies=1\n",
+                     cascadePositionHoldEnabled ? 1 : 0);
+    } else if (rest == "electrical") {
+      Console.printf("OK cascade_electrical R=%.8f Ke=%.8f kp=%.8f ki=%.8f max_pwm=%.0f volatile=1\n",
+                     modelResistanceOhm, modelKeVoltSecondsPerRad,
+                     cascadeCurrentKp, cascadeCurrentKi, cascadeCurrentMaxPwm);
+    } else if (rest.startsWith("electrical ")) {
+      float resistance=0.0f, ke=0.0f, kp=0.0f, ki=0.0f, maxPwm=0.0f;
+      char extra=0;
+      if (sscanf(rest.c_str(), "electrical %f %f %f %f %f %c",
+                 &resistance, &ke, &kp, &ki, &maxPwm, &extra) != 5 ||
+          !isfinite(resistance) || !isfinite(ke) || !isfinite(kp) ||
+          !isfinite(ki) || !isfinite(maxPwm) ||
+          resistance < 0.05f || resistance > 20.0f || ke < 0.0001f || ke > 0.2f ||
+          kp < 0.0f || kp > 5000.0f || ki < 0.0f || ki > 2000000.0f ||
+          maxPwm < 1.0f || maxPwm > PWM_MAX) {
+        Console.println("ERR electrical: R(.05..20) Ke(.0001...2) KP(0..5000) KI(0..2000000) MAX_PWM(1..4095)");
+        return;
+      }
+      if (controlMode != CONTROL_IDLE || commandedPwmDuty != 0 ||
+          modelControlActive || positionActive || identificationRunActive ||
+          modelIdentificationEnabled || syncMotionArmed) {
+        Console.println("ERR electrical: stop and disable identification/sync before changing model and PI");
+        return;
+      }
+      // All checks precede writes. Main-loop control cannot observe a partial
+      // group; no saveMotorModel() here: candidate/rollback are RAM-only.
+      modelResistanceOhm=resistance;
+      modelKeVoltSecondsPerRad=ke;
+      electricalTheta[0]=resistance; electricalTheta[1]=ke;
+      cascadeCurrentKp=kp; cascadeCurrentKi=ki; cascadeCurrentMaxPwm=maxPwm;
+      cascadeCurrentIntegral=0.0f;
+      Console.printf("OK cascade_electrical R=%.8f Ke=%.8f kp=%.8f ki=%.8f max_pwm=%.0f volatile=1\n",
+                     modelResistanceOhm, modelKeVoltSecondsPerRad,
+                     cascadeCurrentKp, cascadeCurrentKi, cascadeCurrentMaxPwm);
     } else if (rest.startsWith("current ")) {
       float kp = 0.0f, ki = 0.0f, maxPwm = 0.0f;
       if (sscanf(rest.c_str(), "current %f %f %f", &kp, &ki, &maxPwm) != 3 ||
           !isfinite(kp) || !isfinite(ki) || !isfinite(maxPwm) ||
-          kp < 0.0f || kp > 5000.0f || ki < 0.0f || ki > 100000.0f ||
+          kp < 0.0f || kp > 5000.0f || ki < 0.0f || ki > 2000000.0f ||
           maxPwm < 1.0f || maxPwm > PWM_MAX) {
-        Console.println("ERR usage: cascade current KP(0..5000) KI(0..100000) MAX_PWM(1..4095)");
+        Console.println("ERR usage: cascade current KP(0..5000) KI(0..2000000) MAX_PWM(1..4095)");
         return;
       }
+      cascadeCurrentIntegral = motor_control::rescaleIntegral(
+          cascadeCurrentIntegral, cascadeCurrentKi, ki, maxPwm);
       cascadeCurrentKp = kp; cascadeCurrentKi = ki; cascadeCurrentMaxPwm = maxPwm;
-      cascadeCurrentIntegral = 0.0f;
       Console.printf("OK cascade_current kp=%.3f ki=%.3f max_pwm=%.0f hz=2000\n", kp, ki, maxPwm);
     } else if (rest.startsWith("velocity ")) {
       float kp = 0.0f, ki = 0.0f, maxCurrent = 0.0f, friction = cascadeVelocityFrictionA;
@@ -2832,15 +3872,15 @@ static void handleCommand(String cmd) {
         Console.println("ERR usage: cascade velocity KP(0..1) KI(0..1) MAX_CURRENT_A(0.05..7) [FRICTION_A(0..5)] [CURRENT_SLEW_A_PER_S(0.1..100)] [BRAKE_SLEW_MULTIPLIER(1..50)]");
         return;
       }
+      cascadeVelocityIntegral = motor_control::rescaleIntegral(
+          cascadeVelocityIntegral, cascadeVelocityKi, ki,
+          min(maxCurrent, modelCurrentLimitAmps));
       cascadeVelocityKp = kp; cascadeVelocityKi = ki;
       cascadeVelocityMaxCurrentA = maxCurrent;
       cascadeVelocityFrictionA = friction;
       cascadeVelocityCurrentSlewAps = currentSlew;
       cascadeVelocityBrakeSlewMultiplier = brakeSlewMultiplier;
-      cascadeVelocityIntegral = 0.0f;
-      cascadeVelocityBreakawayA = 0.0f;
-      cascadeVelocityStictionActive = false;
-      Console.printf("OK cascade_velocity kp=%.6f ki=%.6f max_current=%.3fA friction=%.3fA current_slew=%.2fA/s brake_slew_x=%.1f hz=200\n",
+      Console.printf("OK cascade_velocity kp=%.6f ki=%.6f max_current=%.3fA friction=%.3fA current_slew=%.2fA/s brake_slew_x=%.1f hz=500\n",
                     kp, ki, maxCurrent, friction, currentSlew,
                     brakeSlewMultiplier);
     } else if (rest.startsWith("low_speed_current ")) {
@@ -2903,12 +3943,14 @@ static void handleCommand(String cmd) {
         Console.println("ERR usage: cascade position KP KI KD MAX_VELOCITY_DPS DEADBAND_DEG [MIN_VELOCITY_DPS] [ACCELERATION_DPS2] [REVERSE_KD_SCALE]");
         return;
       }
+      cascadePositionIntegral = motor_control::rescaleIntegral(
+          cascadePositionIntegral, cascadePositionKi, ki, maxVelocity);
       cascadePositionKp = kp; cascadePositionKi = ki; cascadePositionKd = kd;
       cascadePositionMaxVelocityDps = maxVelocity;
       cascadePositionMinVelocityDps = minVelocity;
       cascadePositionMaxAccelerationDps2 = acceleration;
       cascadePositionReverseKdScale = reverseKdScale;
-      cascadePositionDeadbandDeg = deadband; cascadePositionIntegral = 0.0f;
+      cascadePositionDeadbandDeg = deadband;
       cascadePositionSettled = false;
       Console.printf("OK cascade_position kp=%.3f ki=%.3f kd=%.3f reverse_kd_scale=%.2f max_velocity=%.1f min_velocity=%.1f acceleration=%.1f deadband=%.2f position_velocity_hz=500 position_hz=200\n",
                     kp, ki, kd, reverseKdScale, maxVelocity, minVelocity,
@@ -2941,7 +3983,10 @@ static void handleCommand(String cmd) {
       Console.println("ERR usage: sensepolarity normal|invert");
       return;
     }
-    currentSensePolarity = rest == "invert" ? -1 : 1;
+    motorStop();
+    const int8_t requestedSense = rest == "invert" ? -1 : 1;
+    if (requestedSense != currentSensePolarity && !invalidateStoredRotorCompensation()) return;
+    currentSensePolarity = requestedSense;
     saveMotorModel();
     resetCascadeController();
     Console.printf("OK sensepolarity=%s sign=%d\n", rest.c_str(),
@@ -2999,6 +4044,7 @@ static void handleCommand(String cmd) {
     if (readEncoder(raw, deg)) Console.printf("ENCODER ok raw=%u single=%.3fdeg multi=%.3fdeg addr=0x%02X\n", raw, deg, encoderMultiTurnDegrees, MT6701_ADDR);
     else Console.println("ENCODER ERR no ACK/data from 0x06");
   } else if (op == "encreset" || op == "encoder_reset") {
+    motorStop(); // Never move the coordinate origin under an active torque law.
     if (rebaseEncoderMultiTurn()) Console.printf("OK encoder_rebase single=%.3fdeg multi=%.3fdeg\n", encoderLastSingleTurnDegrees, encoderMultiTurnDegrees);
     else Console.println("ERR encoder rebase failed");
   } else if (op == "rawadc") {
@@ -3006,7 +4052,9 @@ static void handleCommand(String cmd) {
     const float busV = readBusVoltage(&busMv);
     const float currentRawMv = readCurrentSenseMillivolts();
     trackCurrentZeroAtIdle(currentRawMv);
-    const float currentMv = filterCurrentSenseMillivolts(currentRawMv);
+    // A diagnostic query must not advance the regulator's current filter.
+    const float currentMv = modelControlActive ? currentFilteredMillivolts
+        : filterCurrentSenseMillivolts(currentRawMv);
     Console.printf("ADC bus=%.0fmV bus_calc=%.3fV current_raw=%.0fmV current_filtered=%.0fmV signed=%.0fmA\n",
                   busMv, busV, currentRawMv, currentMv, readSignedCurrentMilliamps(currentMv));
   } else if (op == "businfo") {
@@ -3103,6 +4151,13 @@ static void handleCommand(String cmd) {
         Console.println("ERR nFAULT low");
         return;
       }
+      if (syncMode == SYNC_FORCE) {
+        syncForceStartedMs = millis();
+        syncForceStartBusV = readBusVoltage();
+        if (!driverSupplyValid(syncForceStartBusV)) {
+          Console.println("ERR force arm invalid supply"); return;
+        }
+      }
       syncMotionArmed = true;
       syncResetLinkCounters();
       Console.printf("OK sync_armed mode=%s peer=%u leader=%d period=%luus\n",
@@ -3175,7 +4230,9 @@ static void handleCommand(String cmd) {
       syncStiffnessMaPerDeg = stiffness;
       syncDampingMaPerDps = damping;
       syncReflectionGain = reflection;
-      syncCurrentLimitMa = limit;
+      syncCurrentLimitMa = min(limit, interaction::operatingCurrentLimit(motorProfileCurrentLimitA) * 1000.0f);
+      syncForceStartedMs = millis();
+      syncForceStartBusV = readBusVoltage();
       syncPositionOffsetDeg = offset;
       syncMaxDuty = static_cast<uint16_t>(duty);
       syncTimeoutMs = static_cast<uint32_t>(timeout);
@@ -3197,14 +4254,16 @@ static void handleCommand(String cmd) {
                   currentSensePolarity < 0 ? "invert" : "normal",
                   modelResistanceOhm, modelKeVoltSecondsPerRad, mechanicalTheta[0], mechanicalTheta[1],
                   static_cast<unsigned long>(modelElectricalSamples), static_cast<unsigned long>(modelMechanicalSamples));
+    Console.println("CAPS output_position=1 knob=1 haptic_protocol=1 electrical_group=1 interaction_guard=1 speed_warning_only=1 speed_derate_output_rps=10 speed_coast_output_rps=12");
   } else if (op == "direction") {
-    if (rest == "normal") modelDirectionSign = 1;
-    else if (rest == "invert") modelDirectionSign = -1;
-    else {
+    if (rest != "normal" && rest != "invert") {
       Console.println("ERR usage: direction normal|invert");
       return;
     }
     motorStop();
+    const int8_t requestedDirection = rest == "invert" ? -1 : 1;
+    if (requestedDirection != modelDirectionSign && !invalidateStoredRotorCompensation()) return;
+    modelDirectionSign = requestedDirection;
     saveMotorModel();
     Console.printf("OK direction=%s pwm=0\n", modelDirectionSign < 0 ? "invert" : "normal");
   } else if (op == "identify") {
@@ -3215,7 +4274,8 @@ static void handleCommand(String cmd) {
     } else if (rest == "start") {
       if (!driverAwake) { Console.println("ERR driver sleeping; run wake first"); return; }
       if (digitalRead(PIN_NFAULT) == LOW) { Console.println("ERR nFAULT low"); return; }
-      if (readBusVoltage() < 2.0f) { Console.println("ERR bus_low; check motor supply"); return; }
+      const float busV = readBusVoltage();
+      if (!driverSupplyValid(busV)) { printDriverSupplyError("identify", busV); return; }
       resetMotorModel();
       setCurrentStep(3);
       modelIdentificationEnabled = true;
@@ -3230,6 +4290,8 @@ static void handleCommand(String cmd) {
       if (!modelControlActive) controlMode = CONTROL_IDLE;
       Console.println("OK identify=off");
     } else if (rest == "reset") {
+      motorStop();
+      if (!invalidateStoredRotorCompensation()) return;
       resetMotorModel();
       saveMotorModel();
       Console.println("OK model reset; default model restored");
@@ -3246,13 +4308,23 @@ static void handleCommand(String cmd) {
     }
     if (!driverAwake) { Console.println("ERR driver sleeping; run wake first"); return; }
     if (digitalRead(PIN_NFAULT) == LOW) { Console.println("ERR nFAULT low"); return; }
-    if (readBusVoltage() < 2.0f) { Console.println("ERR bus_low; check motor supply"); return; }
+    const float busV = readBusVoltage();
+    if (!driverSupplyValid(busV)) { printDriverSupplyError("motion", busV); return; }
     setCurrentStep(3);
     const bool seamlessVelocityRetarget =
         op != "current" && modelControlActive &&
         controlMode == CONTROL_VELOCITY;
+    const bool seamlessCurrentRetarget = op == "current" && modelControlActive &&
+                                        controlMode == CONTROL_CURRENT;
+    if (op == "current" && !seamlessCurrentRetarget) {
+      currentStartBusV = busV;
+      interactionGuard = interaction::Guard{};
+      // Direct current already has its own 10 A/s reference slew.
+      interactionGuard.gain = 1.f;
+      interactionNotice = interaction::Clear;
+    }
     const float previousVelocityTargetDps = modelTargetVelocityDps;
-    if (!seamlessVelocityRetarget) {
+    if (!seamlessVelocityRetarget && !seamlessCurrentRetarget) {
       resetCascadeController();
     } else if (previousVelocityTargetDps * target < 0.0f) {
       // Preserve the live velocity command for ordinary slider changes. On a
@@ -3274,7 +4346,8 @@ static void handleCommand(String cmd) {
     // after the first arrival so a later disturbance is corrected back to the
     // target. STOP remains the explicit way to leave this mode.
     modelStopAtMs = millis() + static_cast<uint32_t>(timeout);
-    modelMaxDuty = static_cast<uint16_t>(duty);
+    modelMaxDuty = min<uint16_t>(static_cast<uint16_t>(duty),
+                                 motorProfileVoltageDutyLimit(busV));
     if (!seamlessVelocityRetarget) {
       lastModelTickMs = 0;
       modelPreviousSampleUs = 0;
@@ -3285,7 +4358,7 @@ static void handleCommand(String cmd) {
                                  ? millis() + 25 : 0;
     Console.printf("OK model_%s target=%.3f%s max_duty=%u timeout=%dms identify=%d\n",
                   controlMode == CONTROL_CURRENT ? "current" : "velocity", target,
-                  controlMode == CONTROL_CURRENT ? "A*1000" : "deg/s",
+                  controlMode == CONTROL_CURRENT ? "mA" : "deg/s",
                   static_cast<unsigned>(modelMaxDuty), timeout, modelIdentificationEnabled ? 1 : 0);
   } else if (op == "stream") {
     if (rest == "off") {
@@ -3309,8 +4382,8 @@ static void handleCommand(String cmd) {
       return;
     }
     const float recoverBusVoltage = readBusVoltage();
-    if (recoverBusVoltage < 6.0f) {
-      Console.printf("ERR recover blocked: bus_low=%.2fV\n", recoverBusVoltage);
+    if (!driverSupplyValid(recoverBusVoltage)) {
+      printDriverSupplyError("recover", recoverBusVoltage);
       return;
     }
     // A driver may stop switching after a transient while nFAULT has already
@@ -3321,13 +4394,23 @@ static void handleCommand(String cmd) {
     setDriverAwake(false);
     delay(2);
     setDriverAwake(true);
-    configurePwmHardware();
+    if (!driverAwake) return;
+    if (!configurePwmHardware()) {
+      setDriverAwake(false);
+      Console.println("ERR pwm_not_configured; recover failed, output disabled");
+      return;
+    }
     powerPathFaultLatched = false;
     Console.printf("OK recovered power_path_fault=0 bus=%.2fV pwm=0\n",
                    recoverBusVoltage);
   } else if (op == "wake") {
+    if (pwmConfiguredHz <= 0) {
+      Console.println("ERR pwm_not_configured; driver remains disabled");
+      return;
+    }
     const bool resetPerformed = !driverAwake;
     setDriverAwake(true);
+    if (!driverAwake) return;
     Console.printf("OK driver_awake=1 pwm=%u reset=%d\n",
                    static_cast<unsigned>(pwmDuty()),
                    resetPerformed ? 1 : 0);
@@ -3348,14 +4431,14 @@ static void handleCommand(String cmd) {
     currentStep = static_cast<uint8_t>(step);
     Console.printf("OK step=%d I0=%d I1=%d\n", step, step & 1 ? 1 : 0, step & 2 ? 1 : 0);
   } else if (op == "decay") {
-    if (rest == "slow") { digitalWrite(PIN_DECAY, LOW); Console.println("OK decay=slow"); }
-    else if (rest == "fast") { digitalWrite(PIN_DECAY, HIGH); Console.println("OK decay=fast"); }
+    if (rest == "slow") { runningDecayFast = false; digitalWrite(PIN_DECAY, pwmDuty() ? LOW : HIGH); Console.println("OK decay=slow stop=coast"); }
+    else if (rest == "fast") { runningDecayFast = true; digitalWrite(PIN_DECAY, HIGH); Console.println("OK decay=fast stop=coast"); }
     else Console.println("ERR usage: decay slow|fast");
   } else if (op == "led") {
     if (rest == "on") { digitalWrite(PIN_LED, HIGH); Console.println("OK led=on"); }
     else if (rest == "off") { digitalWrite(PIN_LED, LOW); Console.println("OK led=off"); }
     else Console.println("ERR usage: led on|off");
-  } else if (op == "pos") {
+  } else if (op == "pos" || op == "posout") {
     float target = 0.0f;
     int duty = 0, timeout = 0;
     if (sscanf(rest.c_str(), "%f %d %d", &target, &duty, &timeout) != 3 ||
@@ -3364,11 +4447,13 @@ static void handleCommand(String cmd) {
       Console.println("ERR usage: pos target_deg(-36000..36000) duty(12..4095) timeout_ms(100..30000)");
       return;
     }
+    if (op == "posout") target *= motorProfileGearRatio;
+    if (!isfinite(target)) { Console.println("ERR invalid output coordinate"); return; }
     if (!driverAwake) { Console.println("ERR driver sleeping; run wake first"); return; }
     if (digitalRead(PIN_NFAULT) == LOW) { Console.println("ERR nFAULT low"); return; }
     const float busV = readBusVoltage();
-    if (busV < 2.0f) {
-      Console.printf("ERR bus_low=%.2fV; check motor supply and ground\n", busV);
+    if (!driverSupplyValid(busV)) {
+      printDriverSupplyError("position", busV);
       return;
     }
     setCurrentStep(3);
@@ -3380,7 +4465,7 @@ static void handleCommand(String cmd) {
     const float newError = target - encoderMultiTurnDegrees;
     if (!seamlessRetarget) {
       resetCascadeController();
-    } else {
+    } else if (fabsf(target - modelTargetPositionDegrees) > 0.00001f) {
       cascadePositionIntegral = 0.0f;
       cascadePositionSettled = false;
       // A live target update invalidates any old-direction breakaway pulse.
@@ -3404,7 +4489,8 @@ static void handleCommand(String cmd) {
     cascadePositionReleased = false;
     modelTargetVelocityDps = 0.0f;
     modelTargetCurrentAmps = 0.0f;
-    modelMaxDuty = static_cast<uint16_t>(duty);
+    modelMaxDuty = min<uint16_t>(static_cast<uint16_t>(duty),
+                                 motorProfileVoltageDutyLimit(busV));
     modelStopAtMs = millis() + static_cast<uint32_t>(timeout);
     modelControlActive = true;
     controlMode = CONTROL_POSITION;
@@ -3447,10 +4533,16 @@ static void handleCommand(String cmd) {
       currentStep = 2;
       Console.println("INFO step=2 (38%) selected for manual motion");
     }
+    const float busV = readBusVoltage();
+    if (!driverSupplyValid(busV)) { printDriverSupplyError("manual", busV); return; }
+    const uint16_t appliedDuty = min<uint16_t>(
+        static_cast<uint16_t>(duty), motorProfileVoltageDutyLimit(busV));
     setModelPhase(op == "cw" ? 1.0f : -1.0f);
-    setPwm(static_cast<uint16_t>(duty));
+    setPwm(appliedDuty);
     stopAtMs = millis() + static_cast<uint32_t>(duration);
-    Console.printf("OK motion=%s duty=%d time=%dms\n", op.c_str(), duty, duration);
+    Console.printf("OK motion=%s requested_duty=%d applied_duty=%u time=%dms profile=%s\n",
+                   op.c_str(), duty, static_cast<unsigned>(appliedDuty), duration,
+                   motorProfileName());
   } else {
     Console.println("ERR unknown command; type help");
   }
@@ -3468,10 +4560,23 @@ void setup() {
   pinMode(PIN_NFAULT, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT);    digitalWrite(PIN_LED, LOW);
 
+  usb_link::boot(usbRecovery, esp_reset_reason() == ESP_RST_POWERON);
+  bootWasUsbRecovery = usbRecovery.pending && esp_reset_reason() == ESP_RST_SW;
+  usbRecovery.pending = 0;
+
   // Bring up the native USB console before touching the encoder bus.  A
   // missing/stuck MT6701 must never leave a present USB CDC port unable to
   // accept STOP/diagnostic commands during setup.
+  #if ARDUINO_USB_CDC_ON_BOOT && !ARDUINO_USB_MODE
+  Serial.setRxBufferSize(1024);
+  #endif
   Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT && !ARDUINO_USB_MODE
+  // availableForWrite() must never wait behind a stalled USB endpoint. The
+  // DualConsole ring above is the only place that buffers diagnostic output.
+  Serial.setTxTimeoutMs(0);
+#endif
+  Console.begin();
   delay(250);
   Console.printf("\n%s %s\n", FW_NAME, FW_VERSION);
   Console.println("BOOT: USB console ready; driver still disabled");
@@ -3479,18 +4584,27 @@ void setup() {
   analogReadResolution(12);
   analogSetPinAttenuation(PIN_VBAT_ADC, ADC_11db);
   analogSetPinAttenuation(PIN_CURRENT_ADC, ADC_11db);
+  analogRead(PIN_CURRENT_ADC);
+  analogRead(PIN_VBAT_ADC);
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12,
+                           1100, &adcCalibration);
+  adcCalibrationReady = true;
   const bool pwmReady = configurePwmHardware();
+  loadMotorProfileSelection();
+  applyMotorProfileDefaults();
   resetMotorModel();
   loadMotorModel();
+  loadMotorSettings();
   calibrateCurrentZero();
 
   // MT6701 supports fast I2C operation; 1 MHz leaves enough margin for a
   // 500 Hz position-mode sample while the 100 Hz USB stream remains separate.
   Wire.begin(PIN_SDA, PIN_SCL, 1000000);
   // Never let an encoder wiring fault block setup/loop and starve USB CDC.
-  // The normal transaction is sub-millisecond at 1 MHz; 3 ms is enough for
-  // a valid read while keeping the console responsive when SDA/SCL is stuck.
-  Wire.setTimeOut(3);
+  // A normal transaction is sub-millisecond at 1 MHz; the 1 ms timeout keeps
+  // the console responsive when SDA/SCL is stuck.
+  Wire.setTimeOut(1);
   bool bootEncoderZeroed = false;
   for (uint8_t attempt = 0; attempt < 5 && !bootEncoderZeroed; ++attempt) {
     bootEncoderZeroed = rebaseEncoderMultiTurn();
@@ -3507,11 +4621,41 @@ void setup() {
                 static_cast<unsigned>(PWM_MAX));
   Console.printf("ENCODER boot_zero=%d multi=%.2f\n", bootEncoderZeroed ? 1 : 0,
                 encoderMultiTurnDegrees);
+  printMotorProfile();
   printHelp();
   printStatus();
+  // Arduino feeds this task once per loop(). A blocked control loop resets
+  // into the asleep/PWM=0 boot state; this is not an electrical E-stop.
+  if (esp_task_wdt_init(1, true) == ESP_OK) {
+    enableLoopWDT();
+    loopWatchdogReady = esp_task_wdt_status(nullptr) == ESP_OK;
+  }
+  Console.printf("WATCHDOG_CFG loop=%d timeout_ms=1000\n", loopWatchdogReady ? 1 : 0);
 }
 
 void loop() {
+  const uint32_t loopNowUs = micros();
+  if (loopPreviousUs) loopMaxGapUs = max(loopMaxGapUs, loopNowUs - loopPreviousUs);
+  loopPreviousUs = loopNowUs;
+  Console.pump();
+  const uint32_t disconnects = Console.disconnects();
+  if (disconnects != usbObservedDisconnects) {
+    usbObservedDisconnects = disconnects;
+    setDriverAwake(false);
+    usbCommandLine.clear();
+    // Discard the bounded RX queue from the closed session, never replay a
+    // half-command or a queued target when the host opens a new session.
+    for (unsigned n = 0; n < 1024 && Serial.available() > 0; ++n) Serial.read();
+  }
+  // Last-resort recovery for a connected-but-dead USB IN endpoint, not a
+  // periodic reset. STOP/sleep precede reset, no previous target is restored.
+  // At most two attempts per power cycle; do not create an endless boot loop.
+  if (Console.stalledMs() > 1500) {
+    setDriverAwake(false);
+    if (usb_link::requestRecovery(usbRecovery, Console.stalledMs())) {
+      ESP.restart();
+    }
+  }
   // Consume the real-time DATA frame before the control tick so a fresh
   // remote state is used by the same iteration. The old 2 ms delay made the
   // ASCII bridge look responsive but added an avoidable control-cycle floor.
@@ -3529,17 +4673,37 @@ void loop() {
     motorStop();
     Console.println("AUTO stop");
   }
-  while (Serial.available()) {
+  unsigned commands = 0;
+  for (unsigned n = 0; n < 128 && commands < 4 && Serial.available() > 0; ++n) {
     const char ch = static_cast<char>(Serial.read());
-    if (ch == '\n' || ch == '\r') {
-      handleCommand(line);
-      line = String();
-    } else if (line.length() < 100) {
-      line += ch;
+    const auto result = usbCommandLine.feed(ch);
+    if (result == usb_link::LineResult::Ready) {
+      ++commands;
+      usbLastCommandMs = millis();
+      handleCommand(String(usbCommandLine.text()));
+    } else if (result == usb_link::LineResult::Rejected) {
+      ++commands;
+      ++usbRejectedCommands;
+      Console.println("ERR command_too_long_or_invalid; entire command rejected");
     }
   }
   busProcessRx();
   syncTick();
   busTransactionTick();
-  delayMicroseconds(100);
+  // Dump traces only after the actuator stops, one bounded line per loop.
+  // High-rate measurements are stored in RAM, never streamed in the ISR/task.
+  if (currentTraceDumping && !modelControlActive && pwmDuty() == 0 && Console.pendingBytes() < 1000) {
+    if (currentTraceDumpIndex < currentTraceCount) {
+      const auto &sample = currentTrace[currentTraceDumpIndex++];
+      Console.printf("T,%llu,%.5f,%.5f,%.1f,%.4f,%.3f,%lu,%.3f\n", static_cast<unsigned long long>(sample.us),
+                     sample.referenceA, sample.measuredA, sample.priorPwm,
+                     sample.rotorPositionDeg, sample.rotorVelocityDps,
+                     static_cast<unsigned long>(sample.encoderAgeUs), sample.busV);
+    } else {
+      Console.printf("TRACE_END count=%u\n", static_cast<unsigned>(currentTraceCount));
+      currentTraceDumping = false;
+    }
+  }
+  Console.pump();
+  delayMicroseconds(modelControlActive ? 20 : 100);
 }

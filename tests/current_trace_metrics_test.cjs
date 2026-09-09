@@ -1,0 +1,12 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const source=fs.readFileSync(require('node:path').join(__dirname,'../web/dashboard.js'),'utf8'),ctx=vm.createContext({});
+vm.runInContext(source.slice(source.indexOf('function currentTraceMetrics('),source.indexOf('function fitControlRows(')),ctx);
+const trace=Array.from({length:360},(_,i)=>[i*500,.15,.15*(1-Math.exp(-i/10)),100]);
+assert(ctx.currentTraceMetrics(trace,.15).passed);
+assert(ctx.currentTraceMetrics(trace.map(r=>[r[0],-r[1],-r[2],-r[3]]),-.15).passed);
+assert(!ctx.currentTraceMetrics(trace.map(r=>[r[0],r[1],r[2]+.06,r[3]]),.15).passed);
+assert(!ctx.currentTraceMetrics(trace.map(r=>[r[0],0,r[2],r[3]]),.15).passed);
+const spike=trace.map(r=>[...r]);spike[50][2]=-.5;
+assert(!ctx.currentTraceMetrics(spike,.15).passed);
+assert.throws(()=>ctx.currentTraceMetrics(trace.slice(0,100),.15),/时间不足/);
+console.log('PASS: short-pulse tracking, signed peaks, target reference, coverage');

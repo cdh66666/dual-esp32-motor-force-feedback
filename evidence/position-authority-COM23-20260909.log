@@ -1,0 +1,160 @@
+SELECTED COM23 68EE8F52A79C 1-8.2:x.0
+C:\Users\admin\scoop\apps\python313\current\Lib\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.7.0) or chardet (7.4.3)/charset_normalizer (3.4.7) doesn't match a supported version!
+  warnings.warn(
+Processing esp32-s3-devkitc-1 (platform: espressif32@6.4.0; board: esp32-s3-devkitc-1; framework: arduino)
+--------------------------------------------------------------------------------
+C:\Users\admin\scoop\apps\python313\current\Lib\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.7.0) or chardet (7.4.3)/charset_normalizer (3.4.7) doesn't match a supported version!
+  warnings.warn(
+Verbose mode can be enabled via `-v, --verbose` option
+CONFIGURATION: https://docs.platformio.org/page/boards/espressif32/esp32-s3-devkitc-1.html
+PLATFORM: Espressif 32 (6.4.0) > Espressif ESP32-S3-DevKitC-1-N8 (8 MB QD, No PSRAM)
+HARDWARE: ESP32S3 240MHz, 320KB RAM, 8MB Flash
+DEBUG: Current (esp-builtin) On-board (esp-builtin) External (cmsis-dap, esp-bridge, esp-prog, iot-bus-jtag, jlink, minimodule, olimex-arm-usb-ocd, olimex-arm-usb-ocd-h, olimex-arm-usb-tiny-h, olimex-jtag-tiny, tumpa)
+PACKAGES: 
+ - framework-arduinoespressif32 @ 3.20011.230801 (2.0.11) 
+ - tool-esptoolpy @ 1.40501.0 (4.5.1) 
+ - toolchain-riscv32-esp @ 8.4.0+2021r2-patch5 
+ - toolchain-xtensa-esp32s3 @ 8.4.0+2021r2-patch5
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+LDF Modes: Finder ~ chain, Compatibility ~ soft
+Found 33 compatible libraries
+Scanning dependencies...
+Dependency Graph
+|-- Preferences @ 2.0.0
+|-- Wire @ 2.0.0
+Building in release mode
+Retrieving maximum program size .pio\build\esp32-s3-devkitc-1\firmware.elf
+Checking size .pio\build\esp32-s3-devkitc-1\firmware.elf
+Advanced Memory Usage is available via "PlatformIO Home > Project Inspect"
+RAM:   [===       ]  26.3% (used 86300 bytes from 327680 bytes)
+Flash: [=         ]  13.5% (used 451517 bytes from 3342336 bytes)
+========================= [SUCCESS] Took 1.87 seconds =========================
+
+Environment         Status    Duration
+------------------  --------  ------------
+esp32-s3-devkitc-1  SUCCESS   00:00:01.865
+========================= 1 succeeded in 00:00:01.865 =========================
+OK stop
+OK sync=off pwm=0
+OK driver_awake=0 pwm=0
+STATUS bus=19.73V bus_adc=1647mV angle=358.48deg multi=-1740.54deg velocity=0.0deg/s raw=16315 nFAULT=1 awake=0 step=3 pwm=0/4095 current_adc=1639mV current_raw=1648mV current_zero=1645mV motor_current=29mA control=idle target=0.00
+ATTACHED_GUARDED user-authorized powered commissioning; motor leads CONNECTED; enclosure per user; reset transients NOT measured
+STATUS bus=19.73V bus_adc=1647mV angle=358.48deg multi=-1740.54deg velocity=0.0deg/s raw=16315 nFAULT=1 awake=0 step=3 pwm=0/4095 current_adc=1646mV current_raw=1640mV current_zero=1645mV motor_current=-4mA control=idle target=0.00
+1200-touch detach: Cannot configure port, something went wrong. Original message: PermissionError(13, '连到系统上的设备没有发挥作用。', None, 31)
+ROM COM18 68:EE:8F:52:A7:9C
+C:\Users\admin\scoop\apps\python313\current\Lib\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.7.0) or chardet (7.4.3)/charset_normalizer (3.4.7) doesn't match a supported version!
+  warnings.warn(
+Processing esp32-s3-devkitc-1 (platform: espressif32@6.4.0; board: esp32-s3-devkitc-1; framework: arduino)
+--------------------------------------------------------------------------------
+C:\Users\admin\scoop\apps\python313\current\Lib\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.7.0) or chardet (7.4.3)/charset_normalizer (3.4.7) doesn't match a supported version!
+  warnings.warn(
+Verbose mode can be enabled via `-v, --verbose` option
+CONFIGURATION: https://docs.platformio.org/page/boards/espressif32/esp32-s3-devkitc-1.html
+PLATFORM: Espressif 32 (6.4.0) > Espressif ESP32-S3-DevKitC-1-N8 (8 MB QD, No PSRAM)
+HARDWARE: ESP32S3 240MHz, 320KB RAM, 8MB Flash
+DEBUG: Current (esp-builtin) On-board (esp-builtin) External (cmsis-dap, esp-bridge, esp-prog, iot-bus-jtag, jlink, minimodule, olimex-arm-usb-ocd, olimex-arm-usb-ocd-h, olimex-arm-usb-tiny-h, olimex-jtag-tiny, tumpa)
+PACKAGES: 
+ - framework-arduinoespressif32 @ 3.20011.230801 (2.0.11) 
+ - tool-esptoolpy @ 1.40501.0 (4.5.1) 
+ - tool-mkfatfs @ 2.0.1 
+ - tool-mklittlefs @ 1.203.210628 (2.3) 
+ - tool-mkspiffs @ 2.230.0 (2.30) 
+ - toolchain-riscv32-esp @ 8.4.0+2021r2-patch5 
+ - toolchain-xtensa-esp32s3 @ 8.4.0+2021r2-patch5
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+LDF Modes: Finder ~ chain, Compatibility ~ soft
+Found 33 compatible libraries
+Scanning dependencies...
+Dependency Graph
+|-- Preferences @ 2.0.0
+|-- Wire @ 2.0.0
+Building in release mode
+Retrieving maximum program size .pio\build\esp32-s3-devkitc-1\firmware.elf
+Checking size .pio\build\esp32-s3-devkitc-1\firmware.elf
+Advanced Memory Usage is available via "PlatformIO Home > Project Inspect"
+RAM:   [===       ]  26.3% (used 86300 bytes from 327680 bytes)
+Flash: [=         ]  13.5% (used 451517 bytes from 3342336 bytes)
+Configuring upload protocol...
+AVAILABLE: cmsis-dap, esp-bridge, esp-builtin, esp-prog, espota, esptool, iot-bus-jtag, jlink, minimodule, olimex-arm-usb-ocd, olimex-arm-usb-ocd-h, olimex-arm-usb-tiny-h, olimex-jtag-tiny, tumpa
+CURRENT: upload_protocol = esptool
+Looking for upload port...
+Using manually specified: COM18
+Uploading .pio\build\esp32-s3-devkitc-1\firmware.bin
+esptool.py v4.5.1
+Serial port COM18
+Connecting...
+Chip is ESP32-S3 (revision v0.2)
+Features: WiFi, BLE
+Crystal is 40MHz
+MAC: 68:ee:8f:52:a7:9c
+Uploading stub...
+Running stub...
+Stub running...
+Configuring flash size...
+Flash will be erased from 0x00000000 to 0x00003fff...
+Flash will be erased from 0x00008000 to 0x00008fff...
+Flash will be erased from 0x0000e000 to 0x0000ffff...
+Flash will be erased from 0x00010000 to 0x0007efff...
+Compressed 15088 bytes to 10373...
+Writing at 0x00000000... (100 %)
+Wrote 15088 bytes (10373 compressed) at 0x00000000 in 0.2 seconds (effective 779.1 kbit/s)...
+Hash of data verified.
+Compressed 3072 bytes to 146...
+Writing at 0x00008000... (100 %)
+Wrote 3072 bytes (146 compressed) at 0x00008000 in 0.0 seconds (effective 910.9 kbit/s)...
+Hash of data verified.
+Compressed 8192 bytes to 47...
+Writing at 0x0000e000... (100 %)
+Wrote 8192 bytes (47 compressed) at 0x0000e000 in 0.1 seconds (effective 1305.4 kbit/s)...
+Hash of data verified.
+Compressed 451888 bytes to 266795...
+Writing at 0x00010000... (5 %)
+Writing at 0x0001b741... (11 %)
+Writing at 0x000296fa... (17 %)
+Writing at 0x0002ee57... (23 %)
+Writing at 0x00034935... (29 %)
+Writing at 0x0003a21c... (35 %)
+Writing at 0x0003f82d... (41 %)
+Writing at 0x000450b3... (47 %)
+Writing at 0x0004ac94... (52 %)
+Writing at 0x00050253... (58 %)
+Writing at 0x00055996... (64 %)
+Writing at 0x0005ab8d... (70 %)
+Writing at 0x0006020c... (76 %)
+Writing at 0x00066b09... (82 %)
+Writing at 0x0006f267... (88 %)
+Writing at 0x00076cce... (94 %)
+Writing at 0x0007c88e... (100 %)
+Wrote 451888 bytes (266795 compressed) at 0x00010000 in 2.4 seconds (effective 1490.3 kbit/s)...
+Hash of data verified.
+
+Leaving...
+Hard resetting via RTS pin...
+========================= [SUCCESS] Took 6.14 seconds =========================
+
+Environment         Status    Duration
+------------------  --------  ------------
+esp32-s3-devkitc-1  SUCCESS   00:00:06.139
+========================= 1 succeeded in 00:00:06.139 =========================
+esptool v5.2.0
+Serial port COM18:
+Connecting...
+Connected to ESP32-S3 on COM18:
+Chip type:          ESP32-S3 (QFN56) (revision v0.2)
+Features:           Wi-Fi, BT 5 (LE), Dual Core + LP Core, 240MHz, Embedded PSRAM 8MB (AP_3v3)
+Crystal frequency:  40MHz
+USB mode:           USB-Serial/JTAG
+MAC:                68:ee:8f:52:a7:9c
+
+Uploading stub flasher...
+Running stub flasher...
+Stub flasher running.
+
+
+Hard resetting via RTS pin...
+OK stop
+OK driver_awake=0 pwm=0
+MODEL fw=0.5.9-sync-trace enabled=0 identify=0 direction=invert sense=invert R=2.00000Ohm Ke=0.011000V/(rad/s) accel_per_A=2500.00(rad/s2)/A friction=0.5000 samples=0/0
+CASCADE_CFG current_hz=2000 kp=600.000 ki=600000.000 max_pwm=4095 velocity_hz=500 kp=0.000800 ki=0.016000 max_current=1.200A friction=0.000A current_slew=80.00A/s brake_slew_x=1.0 position_hz=200 kp=12.000 ki=0.000 kd=0.150 max_velocity=28080.0 acceleration=40000.0 jerk=1200.0 bandwidth=3.00 deadband=0.10 low_speed_current=0.000A breakaway=0.000A/15.0ms retry=120.0ms speed=40.0deg/s ramp=80.0A/s
+STATUS bus=19.73V bus_adc=1647mV angle=358.48deg multi=0.00deg velocity=0.0deg/s raw=16315 nFAULT=1 awake=0 step=0 pwm=0/4095 current_adc=1648mV current_raw=1648mV current_zero=1648mV motor_current=-2mA control=idle target=0.00
+READY COM23 PWM=0; old motion is not resumed

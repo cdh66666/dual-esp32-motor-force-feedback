@@ -5,7 +5,14 @@ __pycache__/
 *.bin
 *.elf
 *.map
+tests/*.exe
+tests/*.obj
 captures/
 evidence/private/
 .env
-
+.env.*
+!.env.example
+.venv/
+node_modules/
+# Raw captures stay local; selected release evidence is explicitly force-added.
+evidence/**

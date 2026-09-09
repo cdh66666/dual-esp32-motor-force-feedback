@@ -3,43 +3,89 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>双板三环电机调试台</title>
-  <link rel="stylesheet" href="/dashboard.css?v=stop-rearm-20260829">
-  <link rel="stylesheet" href="/dashboard-cascade.css?v=stop-rearm-20260829">
+  <title>双电机力反馈 · 实时控制</title>
+  <link rel="stylesheet" href="/dashboard.css?v=36gp-commissioned-20260905">
+  <link rel="stylesheet" href="/dashboard-cascade.css?v=red-targets-20260909">
 </head>
-<body>
+<body class="simple-mode">
   <header class="topbar">
-    <div><h1>双板三环电机调试台</h1><p>2 kHz 电流环 → 200 Hz 速度环 → 200 Hz 位置环 · USB 100 Hz 原始过程</p></div>
+    <div><h1>双电机 · 力反馈</h1><p id="simpleConnection">正在检测设备…</p></div>
     <div class="top-actions">
       <label>显示单位 <select id="unit"><option value="deg">° / °/s</option><option value="rev" selected>圈 / rps</option></select></label>
-      <button id="connectAll">连接全部</button><button id="stopAll" class="danger">全部 STOP</button><button id="resetAll">复位全部</button>
+      <button id="motorSettingsOpen">电机设置</button><button id="connectAll">连接全部</button><button id="stopAll" class="danger">全部 STOP</button><button id="resetAll">复位全部</button>
     </div>
   </header>
+  <section class="scope-panel" aria-label="双板示波器">
+    <div class="scope-heading"><div><span class="eyebrow">LIVE / 双板遥测</span><h2>运动示波器</h2></div><span class="scope-profile">上下双窗 · 每窗四通道 · 独立纵轴</span></div>
+    <div class="scope-toolbar">
+      <label>时间窗 <select id="scopeWindow"><option value="1000">1 s</option><option value="5000" selected>5 s</option><option value="10000">10 s</option></select></label>
+      <button id="scopeZoomIn" aria-label="横向放大">放大 ＋</button><button id="scopeZoomOut" aria-label="横向缩小">缩小 −</button>
+      <button id="scopePause" aria-pressed="false">暂停画面</button><button id="scopeScale" aria-pressed="false">锁定量程</button>
+      <button id="scopeReset">复位视图 / 实时</button>
+    </div>
+    <fieldset id="scopeChannels" data-scope-pane="shared"><legend>显示通道 · 同时应用上下两窗</legend><label><input type="checkbox" data-scope-channel="multi" checked>位置 r</label><label><input type="checkbox" data-scope-channel="velocity">速度 r/s</label><label><input type="checkbox" data-scope-channel="current" checked>电流 A</label><label><input type="checkbox" data-scope-channel="pwm">PWM</label></fieldset>
+    <details class="scope-axis-options"><summary>纵轴调整</summary><div class="scope-toolbar scope-secondary"><label>纵向调整 <select id="scopePane"><option value="0">上窗</option><option value="1">下窗</option></select><select id="scopeYChannel" aria-label="纵向调整通道"><option value="current">电流</option><option value="velocity">速度</option><option value="multi">位置</option><option value="pwm">PWM</option></select></label><button id="scopeYIn">纵向 ＋</button><button id="scopeYOut">纵向 −</button><span id="scopeViewState">实时 · 共享时间轴</span></div></details>
+    <small>实线：实测　<span class="scope-target-key">红色虚线：目标</span>（力反馈位置为对端参考）</small>
+    <div id="scopeLegend" class="scope-legend" aria-live="off"></div>
+    <div id="scopeCursor" class="scope-caption">滚轮缩放时间 · Shift＋滚轮缩放所选通道 · 拖动查看历史 · 双击回到实时。仅改变显示，不控制电机。</div>
+    <canvas id="scopeCanvas" aria-label="上下两个电机窗格；滚轮横向缩放，Shift 加滚轮纵向缩放，拖动查看历史，双击复位"></canvas>
+    <div id="quickControl" class="quick-control">
+      <div class="scope-toolbar"><strong>手动测试</strong><label>控制对象 <select id="quickBoard"><option value="both">两台同时</option><option value="0">仅上窗电机</option><option value="1">仅下窗电机</option></select></label><button id="quickStop" class="danger">停止测试</button></div>
+      <div id="quickRows"></div>
+      <p id="quickState" role="status">拖动即控制所选电机；每台同时只运行一种模式。位置为输出轴多圈坐标，范围 ±10 圈。</p>
+    </div>
+  </section>
+  <section class="auto-panel" aria-labelledby="autoTitle">
+    <dialog id="motorSettingsWindow" aria-labelledby="motorSettingsTitle">
+    <div class="settings-window-bar"><strong id="motorSettingsTitle">电机设置</strong><button id="motorSettingsClose" type="button" aria-label="关闭电机设置">关闭</button></div>
+    <form id="motorSettings" class="motor-settings">
+      <h3>电机设置 · 同时应用到两板</h3>
+      <label>电机额定电压 / V<input id="motorVoltage" type="number" min="3" max="24" step="0.1" value="24" required></label>
+      <label>单台最大电流 / A<input id="motorMaxCurrent" type="number" min="0.1" max="2" step="0.05" value="2" required></label>
+      <label>减速比 / 电机圈数 : 输出圈数<input id="motorGear" type="number" min="1" max="1000" step="0.01" value="5.2" required></label>
+      <button type="submit">停止并保存设置</button>
+      <small id="motorSettingsState" role="status">等待板端回读；输入框不是已保存值。电源为 20 V / 3 A，两台共用；36GP 暂不开放超过 2 A 的未验证上限。</small>
+    </form>
+    </dialog>
+    <div><h2 id="autoTitle">基本检查</h2><p>固定电机、松开手柄。逐台低速正反转，检查方向、速度跟随和工作电流；保留现有控制参数，不再自动覆盖三环参数。</p></div>
+    <button id="identifyCapture" class="primary">检查方向与基本响应</button>
+    <button id="analyzeCapture">分析已有采集 · 不转动电机</button>
+    <button id="autoTune" class="legacy-tune" hidden>实验性参数比较（未验收）</button>
+    <p id="autoState" role="status" aria-live="polite">等待开始；需要配套的滑行停止固件。不会自动恢复旧参数或运动。</p>
+    <progress id="autoProgress" max="100" value="0" aria-label="自动整定进度"></progress>
+    <details><summary>测试结果</summary><pre id="autoReport">暂无本次测试结果</pre></details>
+  </section>
+  <details class="multi-tools" open><summary>双板联动 · 双向力反馈</summary>
   <section class="fleet">
     <strong>双板同步操作</strong>
-    <label>共同位置目标 <output id="fleetTargetOut">0.000 圈</output><input id="fleetTarget" type="range" min="-36000" max="36000" step="1" value="0"></label>
+    <label>共同输出轴目标 <output id="fleetTargetOut">0.000 圈</output><input id="fleetTarget" type="range" min="-36000" max="36000" step="1" value="0"></label>
     <button id="fleetSend" class="primary">两板同时发送位置</button>
     <span id="portSummary">正在检测真实端口…</span>
   </section>
   <section class="haptic">
     <strong>双向力反馈</strong>
-    <label>刚度 <output id="forceKOut">5 mA/°</output><input id="forceK" type="range" min="0" max="50" step="0.5" value="5"></label>
-    <label>阻尼 <output id="forceDOut">0.10 mA/(°/s)</output><input id="forceD" type="range" min="0" max="2" step="0.05" value="0.1"></label>
-    <label>电流上限 <output id="forceLimitOut">1000 mA</output><input id="forceLimit" type="range" min="100" max="4500" step="50" value="1000"></label>
-    <button id="forceStart" class="primary">启动双向力反馈</button>
+    <label class="simple-strength">手感 <select id="simpleStrength"><option value="light">轻柔</option><option value="normal" selected>标准</option><option value="strong">有力</option></select></label>
+    <span>转动一端，另一端跟随。接近边界自动减力并显示黄色提示；严重故障才退出。每轮 60 秒正常结束，可再次启动；当前尚无温度实测，不开放无限时高负载。</span>
+    <label>刚度 <output id="forceKOut">18 mA/°</output><input id="forceK" type="range" min="0" max="50" step="0.5" value="18"></label>
+    <label>阻尼 <output id="forceDOut">0.35 mA/(°/s)</output><input id="forceD" type="range" min="0" max="2" step="0.05" value="0.35"></label>
+    <label>电流上限 <output id="forceLimitOut">1600 mA</output><input id="forceLimit" type="range" min="200" max="2000" step="50" value="1600"></label>
+    <button id="forceStart" class="primary">启动力反馈</button>
     <button id="forceStop" class="danger">停止力反馈</button>
-    <span id="forceState">COM19 DATA 接收硬件暂缓；USB 三环调试不受影响</span>
+    <button id="forceRebase">停止并对齐起点</button>
+    <span id="forceState">力反馈手感已由你验收通过。本轮保留手感参数，更新显示与低速换向误报处理。</span>
   </section>
+  </details>
+  <button id="advancedToggle" aria-expanded="false" class="advanced-toggle">展开高级诊断与手动参数</button>
   <main id="boards"></main>
   <div id="toast"></div>
   <div id="errorModal" class="modal" hidden role="alertdialog" aria-modal="true" aria-labelledby="errorTitle">
     <div class="modal-card">
       <div class="modal-icon">!</div>
       <div><h2 id="errorTitle">控制异常</h2><p id="errorMessage"></p><small id="errorHint"></small></div>
-      <button id="errorRecover" class="primary">停止输出并重新连接</button>
+      <button id="errorRecover" class="primary">停止并检查恢复</button>
       <button id="errorClose" class="danger">关闭</button>
     </div>
   </div>
-  <script type="module" src="/dashboard.js?v=timed-debug-reset-20260829"></script>
+  <script type="module" src="/dashboard.js?v=position-current-authority-20260909"></script>
 </body>
 </html>

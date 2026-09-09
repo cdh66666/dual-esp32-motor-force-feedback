@@ -15,6 +15,7 @@ SPEC.loader.exec_module(server)
 
 class FakeSerial:
     instances: list["FakeSerial"] = []
+    in_waiting = 0
 
     def __init__(self):
         self.is_open = False

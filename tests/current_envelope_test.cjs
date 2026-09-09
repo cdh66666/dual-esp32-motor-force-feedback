@@ -1,0 +1,17 @@
+const assert=require('node:assert/strict');
+const {currentEnvelopeError}=require('../tools/validate_saved_current.cjs');
+const s=Array(24).fill(0);s[3]=20;s[6]=1;
+assert.equal(currentEnvelopeError(s,0,5.2),null);
+s[2]=131;assert.match(currentEnvelopeError(s,0,5.2),/displacement/);
+s[2]=0;s[4]=801;assert.match(currentEnvelopeError(s,0,5.2),/current/);
+s[4]=0;s[3]=22;assert.match(currentEnvelopeError(s,0,5.2),/voltage/);
+s[3]=20;s[6]=0;assert.match(currentEnvelopeError(s,0,5.2),/nFAULT/);
+assert.match(currentEnvelopeError([],0,5.2),/Invalid/);
+console.log('PASS: distinct current test envelope reasons');
+const moving=Array(24).fill(0);moving[3]=20;moving[6]=1;moving[2]=200;
+assert.match(currentEnvelopeError(moving,0,5.2),/displacement/);
+assert.equal(currentEnvelopeError(moving,0,5.2,'moving-current'),null);
+moving[4]=401;assert.match(currentEnvelopeError(moving,0,5.2,'moving-current'),/current/);
+moving[4]=0;moving[10]=2081;assert.match(currentEnvelopeError(moving,0,5.2,'moving-current'),/speed/);
+moving[10]=0;moving[2]=469;assert.match(currentEnvelopeError(moving,0,5.2,'moving-current'),/displacement/);
+assert.match(currentEnvelopeError(moving,0,5.2,'unknown'),/Unknown/);
