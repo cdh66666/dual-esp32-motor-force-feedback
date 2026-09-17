@@ -9,10 +9,11 @@ const ctx=vm.createContext({boards,autoTune:state,Date,Math,JSON,Number,Error,
   formatAutoReport:JSON.stringify,
   document:{body:{classList:{add(){},remove(){}}}},$:()=>({}),
   localStorage:{setItem(){},removeItem(){}},stopForceFeedback:async()=>{},
-  gearOf:()=>5.2,parseLine:()=>{},valueOf:()=>1,parameterToMotor:()=>1,
+  gearOf:()=>5.2,parseLine:(b)=>{b.interactionGuard=true;},valueOf:()=>1,parameterToMotor:()=>1,
   waitUntil:async predicate=>{assert(predicate());},
   send:async(port,command)=>{
     commands.push([port,command]);
+    if(command==='model')boards.get(port).interactionGuard=true;
     if(command==='cascade status')boards.get(port).rotorCompensation={scale:1,coulomb:.137,offset:-.0121};
     if(command.startsWith('cascade current ')) state.cancelled=true;
     return {reply:'CASCADE_CFG breakaway=0.2A/30ms retry=120ms speed=20deg/s ramp=2A/s'};

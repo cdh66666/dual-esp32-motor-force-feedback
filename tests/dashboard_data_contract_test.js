@@ -23,8 +23,11 @@ catch { ({ chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-prim
     // Module lexical bindings can be accessed by a test-only copy imported
     // with exports; avoid modifying the production module's global namespace.
     const source = await (await fetch('/dashboard.js')).text();
-    const declarationOnly = source.slice(0, source.indexOf("$('#unit').addEventListener"));
-    const module = await import(URL.createObjectURL(new Blob([declarationOnly + '\nexport {initialBoard,parseLine,applyMotorProfileUi,ingestLogs,axisRange,resetChartRanges,setTargetWindow,nice};'], {type:'text/javascript'})));
+    const declarationOnly = source.slice(0, source.indexOf("$('#unit').addEventListener"))
+      .replaceAll("import('/gateway-transport.js')", "import('http://127.0.0.1:18766/gateway-transport.js')")
+      .replaceAll("import('/usb-chain-transport.js')", "import('http://127.0.0.1:18766/usb-chain-transport.js')")
+      .replaceAll("import('/remote-motion-lease.js')", "import('http://127.0.0.1:18766/remote-motion-lease.js')");
+    const module = await import(URL.createObjectURL(new Blob([declarationOnly + '\nexport {initialBoard,parseLine,mirrorRemoteForceSample,applyMotorProfileUi,ingestLogs,axisRange,resetChartRanges,setTargetWindow,nice};'], {type:'text/javascript'})));
     const board = module.initialBoard('FAKE');
     board.root = document.querySelector('[data-port="FAKE"]');
     module.applyMotorProfileUi(board,'36gp555');
@@ -34,6 +37,15 @@ catch { ({ chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-prim
     module.parseLine(board,'CASCADE_CFG current_hz=2000 kp=600.000 ki=200000.000 max_pwm=4095 velocity_hz=500 kp=0.001000 ki=0.006000 max_current=0.600A friction=0.000A position_hz=200 kp=4.000 ki=0.000 kd=0.150 max_velocity=12000.0');
     const gainsReadBack = Number(board.root.querySelector('[data-slider="currentKi"]').value) === 200000 &&
       Math.abs(Number(board.root.querySelector('[data-slider="velocityKi"]').value) - 0.006 * 5.2) < 1e-9;
+    const remote=module.initialBoard('DATA-184');
+    remote.remote=true;remote.active=true;remote.entry='FAKE';remote.gear=5.2;remote.latest={t:0,bus:24.25};
+    const peerFields=Array(37).fill('0');peerFields[27]='1';peerFields[28]='1872';
+    peerFields[29]='520';peerFields[30]='400';peerFields[31]='120';peerFields[32]='1';
+    peerFields[33]='1';peerFields[35]='0';peerFields[36]='300';
+    const mirrored=module.mirrorRemoteForceSample(remote,board,{t:1000,forceActive:true},peerFields);
+    const peerCurve=mirrored&&remote.samples.length===1&&Math.abs(remote.latest.multi-360)<1e-9&&
+      Math.abs(remote.latest.velocity-100)<1e-9&&Math.abs(remote.latest.current-.4)<1e-9&&
+      Math.abs(remote.latest.currentTarget-.3)<1e-9;
     const s = (t,multi=720,velocity=360) => `S,${t},0,${multi},20,0,0,1,1,0,0,${velocity},3,720,0,0,0,0,0,1,360,100,100,0,360`;
     module.parseLine(board,s(100));
     const angle = module.axisRange(board,'multi');
@@ -79,7 +91,7 @@ catch { ({ chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-prim
       {seq:3,direction:'rx',text:'CASCADE fault nFAULT=0'}
     ]});
     const liveFaultVisible = !document.querySelector('#errorModal').hidden;
-    return {validOnly,holdSurvivesSettled,epochResets,gainsReadBack,knobReadback,angle,rawDegrees:720,
+    return {validOnly,holdSurvivesSettled,epochResets,gainsReadBack,knobReadback,peerCurve,angle,rawDegrees:720,
       fineRange,readableTicks,preciseTarget,normalEndNotFault,realFaultVisible,
       replayFaultSuppressed,nearStaleSuppressed,liveFaultVisible};
   });
@@ -88,6 +100,7 @@ catch { ({ chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-prim
   assert(results.epochResets);
   assert(results.gainsReadBack, 'board readback must not silently clip PI gains');
   assert(results.knobReadback, 'knob UI must reflect board-side configuration');
+  assert(results.peerCurve, 'single-USB force scope must mirror peer position/speed/current at USB rate from synchronized samples');
   for (const key of ['fineRange','readableTicks','preciseTarget','normalEndNotFault','realFaultVisible']) assert(results[key],key);
   assert(results.replayFaultSuppressed && results.nearStaleSuppressed && results.liveFaultVisible);
   assert(results.angle[1] >= 720/5.2/360 && results.angle[1] < 1, '720 rear degrees must render near 0.385 output turns');

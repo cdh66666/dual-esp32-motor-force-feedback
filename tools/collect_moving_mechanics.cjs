@@ -57,7 +57,7 @@ async function main() {
         report.hwid=device.hwid;
         const profile=await send(port,'motorprofile status'),sync=await send(port,'sync status');
         if(!profile.includes('current_limit=1.50A gear=5.20')||!sync.includes('mode=off')||!sync.includes('armed=0'))throw Error('Profile/sync mismatch');
-        report.model=await send(port,'model');if(!report.model.includes('fw=0.5.9-sync-trace'))throw Error('Unexpected firmware');
+        report.model=await send(port,'model');if(!report.model.includes('fw=0.5.10-single-usb-force'))throw Error('Unexpected firmware: expected 0.5.10-single-usb-force');
         const oldLogs=await api(`logs?port=${port}&since=0`),cfgCursor=Math.max(0,...oldLogs.logs.map(x=>x.seq));
         const config=await send(port,'cascade status');report.originalConfiguration=config;
         if(config.trim()!==saved.originalConfiguration.trim())throw Error('Configuration changed');

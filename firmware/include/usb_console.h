@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include "usb_tx_policy.h"
+#include "command_result.h"
 #if ARDUINO_USB_CDC_ON_BOOT && !ARDUINO_USB_MODE
 #include "tusb.h"
 #include "device/usbd_pvt.h"
@@ -23,6 +24,8 @@ class DualConsole final : public Print {
     return ready_;
   }
   bool ready() const { return ready_; }
+  void beginCommandResult() { commandResult_.begin(); }
+  bool endCommandResult() { return commandResult_.finish(); }
   size_t write(uint8_t c) override { return write(&c, 1); }
   size_t write(const uint8_t *data, size_t count) override {
     if (!data) return 0;
@@ -30,6 +33,7 @@ class DualConsole final : public Print {
     // newline-delimited records so a full queue never creates a fake frame.
     for (size_t i = 0; i < count; ++i) {
       const uint8_t c = data[i];
+      commandResult_.observe(c);
       if (!frameOverflow_) {
         if (frameSize_ < sizeof(frame_)) frame_[frameSize_++] = c;
         else frameOverflow_ = true;
@@ -129,6 +133,7 @@ class DualConsole final : public Print {
   TaskHandle_t worker_ = nullptr;
 #endif
   usb_link::SpscBytes<8192> queue_;
+  gateway::CommandResult commandResult_;
   uint8_t frame_[2048] = {};
   size_t frameSize_ = 0;
   bool frameOverflow_ = false, ready_ = false;

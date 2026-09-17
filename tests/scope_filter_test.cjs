@@ -1,0 +1,13 @@
+const assert=require('node:assert/strict'),fs=require('node:fs');
+const source=fs.readFileSync('web/dashboard.js','utf8');
+eval(source.slice(source.indexOf('function scopeDisplaySamples('),source.indexOf('function scopeSnapshot(')));
+const rows=Array.from({length:100},(_,i)=>({t:i*10,velocity:i%2?2:0,current:i%2?.2:0,multi:i,pwm:i, currentTarget:1}));
+const before=JSON.stringify(rows),out=scopeDisplaySamples(rows,true);
+assert.equal(JSON.stringify(rows),before);
+assert.equal(scopeDisplaySamples(rows,false),rows);
+assert(out.slice(50).every((r,i)=>r.currentRaw===rows[i+50].current&&r.pwm===rows[i+50].pwm&&r.currentTarget===1));
+assert(Math.max(...out.slice(50).map(r=>r.current))-Math.min(...out.slice(50).map(r=>r.current))<.06);
+const step=scopeDisplaySamples([{t:0,current:0,velocity:0},{t:60,current:1,velocity:1},{t:300,current:2,velocity:2}],true);
+assert(step[1].current>.95&&step[1].velocity>.86);
+assert.equal(step[2].current,2);
+console.log('PASS display filter: raw immutable, bypass, attenuation, step response, gap reset');

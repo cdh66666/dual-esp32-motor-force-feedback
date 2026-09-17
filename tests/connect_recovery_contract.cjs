@@ -1,7 +1,13 @@
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
 const source=fs.readFileSync('web/dashboard.js','utf8');
+const backoffCode=source.slice(source.indexOf('function connectBackoffMs'),source.indexOf('function forceState'));
 const code=source.slice(source.indexOf('async function connectOrRecover('),source.indexOf("$('#connectAll').addEventListener"));
 (async()=>{
+ const backoffContext=vm.createContext({Math});
+ vm.runInContext(backoffCode,backoffContext);
+ assert.equal(backoffContext.connectBackoffMs(1),1000);
+ assert.equal(backoffContext.connectBackoffMs(3),4000);
+ assert.equal(backoffContext.connectBackoffMs(99),60000);
  let state,commands=[];
  const context=vm.createContext({api:async(endpoint,body)=>{if(endpoint==='ports')return {ports:[state]};commands.push({endpoint,body});return {ok:true};}});
  vm.runInContext(code,context);

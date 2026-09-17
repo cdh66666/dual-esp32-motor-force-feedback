@@ -5,6 +5,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -16,10 +17,36 @@ from urllib.parse import parse_qs, urlparse
 import serial
 from serial.tools import list_ports
 
+# ``server.py`` is normally launched as a script (where ``web`` is on
+# ``sys.path``), while a few offline tests import it as ``web.server`` or via
+# an explicit module spec.  Keep both supported without requiring callers to
+# mutate ``PYTHONPATH``.
+try:
+    from chain_gateway import ChainGateway, RemoteRejected
+    from device_topology import DeviceTopology
+except ModuleNotFoundError:
+    _WEB_DIR = str(Path(__file__).resolve().parent)
+    if _WEB_DIR not in sys.path:
+        sys.path.insert(0, _WEB_DIR)
+    from chain_gateway import ChainGateway, RemoteRejected
+    from device_topology import DeviceTopology
+
 
 ROOT = Path(__file__).resolve().parent
+topology = DeviceTopology(ROOT / 'device_ids.local.json')
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("MOTOR_DEBUG_PORT", "8766"))
+
+
+def recovery_usb(identity):
+    """Project uses TinyUSB; colon-form MAC denotes hardware USB transport.
+
+    This identifies transport, not a solder fault or proof of ROM execution.
+    Hardware-CDC diagnostic builds also use this transport.
+    """
+    return bool(identity and identity.vid == 0x303A and identity.pid == 0x1001
+                and re.fullmatch(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}',
+                                 identity.serial_number or ''))
 
 
 class ControllerFault(RuntimeError):
@@ -27,13 +54,15 @@ class ControllerFault(RuntimeError):
 
 
 def error_kind(exc):
-    if isinstance(exc, ControllerFault): return "controller"
+    if isinstance(exc, (ControllerFault, RemoteRejected)): return "controller"
     if isinstance(exc, ValueError): return "validation"
     if "STOP" in str(exc) or "排队期间" in str(exc): return "cancelled"
     return "transport"
 
 
 def command_reply_prefix(command: str):
+    if command.startswith('busaddr '): return 'OK busaddr='
+    if command == 'wifi status': return 'WIFI '
     exact = {"stop": "OK stop", "wake": "OK driver_awake=1",
              "sleep": "OK driver_awake=0", "recover": "OK recovered power_path_fault=0",
              "status": "STATUS ", "diag": "DIAG ", "model": "MODEL fw=", "motorprofile status": "MOTOR_PROFILE ",
@@ -70,6 +99,7 @@ def command_reply_prefix(command: str):
 class PortSession:
     def __init__(self, port: str):
         self.port = port
+        self.chain = ChainGateway(self)
         self.ser = None
         self.stop_event = threading.Event()
         self.thread = None
@@ -101,6 +131,7 @@ class PortSession:
         self.capture_at = 0.0
         self.last_capture_reason = ""
         self.maintenance_until = 0.0
+        self.phone_control = False
 
     def add_log(self, direction: str, text: str, *, capture=True):
         fault_snapshot = None
@@ -156,6 +187,8 @@ class PortSession:
 
     def connect(self):
         with self.lifecycle_lock:
+            if self.phone_control:
+                raise RuntimeError("控制权已交给手机，请点击接回电脑")
             if time.monotonic() < self.maintenance_until:
                 raise RuntimeError("串口处于烧录维护中，暂不自动连接")
             # A newly opened handle can briefly precede the reader thread's
@@ -184,6 +217,8 @@ class PortSession:
             # TinyUSB build requires DTR, _monitor performs one adaptive
             # assertion only after the initial stream request gets no RX.
             identity = next((p for p in list_ports.comports() if p.device == self.port), None)
+            if recovery_usb(identity):
+                raise RuntimeError("设备处于 USB 恢复/调试接口，不能当作正常电机端口连接")
             tinyusb = bool(identity and identity.vid == 0x303A and
                            identity.serial_number and ':' not in identity.serial_number)
             ser.dtr = tinyusb
@@ -201,6 +236,9 @@ class PortSession:
             with self.changed:
                 self.session_id = uuid.uuid4().hex
                 self.changed.notify_all()
+            # A reconnect owns a new epoch/session.  Do not let DATA metadata
+            # or an old remote-awake hint leak into the new USB handle.
+            self.chain.invalidate_cache()
             self.write_ok = True
             self.last_error = ""
             self.last_ack_error = ""
@@ -259,6 +297,7 @@ class PortSession:
             ser = self.ser
             self.ser = None
             self.command_epoch += 1
+            self.chain.invalidate_cache()
             self.write_ok = False
             self.reader_alive = False
             # Close before allowing a new connect() to open the same Windows
@@ -286,7 +325,8 @@ class PortSession:
                     "connected_age_ms": age(self.connected_at),
                     "rx_age_ms": age(self.last_rx_at), "sample_age_ms": sample_age,
                     "telemetry_ok": bool(self.reader_alive and sample_age is not None and sample_age < 2500),
-                    "maintenance": now < self.maintenance_until,
+                    "maintenance": now < self.maintenance_until or self.phone_control,
+                    "phone_control": self.phone_control,
                     "last_ack_error": self.last_ack_error, "ack_age_ms": age(self.last_ack_at),
                     "io_serialized": True, "read_timeout_ms": 2}
 
@@ -360,6 +400,10 @@ class PortSession:
     def send(self, command: str, expected_ser=None, expected_epoch=None, expected_session_id=None):
         line = command.strip()
         with self.write_lock, self.lifecycle_lock:
+            if getattr(self,'id_config_owner',None) not in (None,threading.get_ident()) and line not in {'stop','sleep','sync off','status'}:
+                raise RuntimeError('正在配置设备 ID，本次操作未发送')
+            if self.phone_control and line not in {"stop", "sync off", "sleep", "status"}:
+                raise RuntimeError("控制权已交给手机，电脑动作未发送")
             ser = self.ser
             if not ser or not ser.is_open:
                 raise RuntimeError("port is not connected")
@@ -478,6 +522,13 @@ class PortSession:
             return
         try:
             if self.ser is ser and ser.is_open:
+                # A newly opened CDC handle must never inherit an actuator
+                # lease from the previous host/session.  The firmware STOP is
+                # idempotent and clears position/velocity/current/force state
+                # without waking the bridge.  Send it before telemetry probes
+                # so a reconnect cannot resume a stale target while the page
+                # is still rebuilding its session state.
+                self.send("stop", expected_ser=ser)
                 self.send("stream 100", expected_ser=ser)
                 # Monitoring must never change actuator state. A delayed
                 # unconditional WAKE used to reset the controller one second
@@ -602,6 +653,7 @@ def port_info():
             # PID 0002. Both are the same ESP32-S3 boards and must appear in
             # the live dashboard.
             "esp32": "VID:PID=303A:" in (item.hwid or "").upper(),
+            "recovery_usb": recovery_usb(item),
             "present": True,
         })
     return sorted(result, key=lambda x: x["port"])
@@ -654,6 +706,7 @@ def usb_problem_devices():
 
 
 def validate_command(command: str, _armed: bool = True):
+    if command == 'wifi status': return command
     if not isinstance(command, str) or len(command) > 127 or any(
         ord(c) < 32 and c != '\t' or ord(c) > 126 for c in command
     ):
@@ -671,7 +724,7 @@ def validate_command(command: str, _armed: bool = True):
                 0 <= damping <= 10 and spacing <= width <= 720):
                 return "knob config " + " ".join(f"{v:g}" for v in (effect, spacing, peak, damping, width))
         raise ValueError("旋钮参数无效：模式0..3，输出轴间距2..90°，强度0..600 mA，阻尼0..10 mA/(°/s)，范围间距..720°")
-    safe = {"help", "status", "diag", "encoder", "encreset", "rawadc", "model", "motorprofile status", "businfo", "wake", "recover", "sleep", "stop", "led on", "led off", "decay slow", "decay fast", "pospid on", "pospid off", "pospid status", "cascade status", "sync off", "sync stop", "sync disarm", "sync status"}
+    safe = {"help", "status", "diag", "encoder", "encreset", "rawadc", "model", "motorprofile status", "businfo", "wake", "recover", "sleep", "stop", "led on", "led off", "led auto", "decay slow", "decay fast", "pospid on", "pospid off", "pospid status", "cascade status", "sync off", "sync stop", "sync disarm", "sync status"}
     if command in safe:
         return command
     if command in {"cascade hold on", "cascade hold off"}:
@@ -724,7 +777,7 @@ def validate_command(command: str, _armed: bool = True):
             raise ValueError("invalid force-feedback peer or parameter")
         if not 0 <= stiffness <= 1000 or not 0 <= damping <= 1000 or not 0 <= reflection <= 4:
             raise ValueError("force-feedback gain outside firmware range")
-        if not 10 <= limit <= 4500 or not 12 <= duty <= 4095 or not 100 <= timeout <= 30000 or abs(offset) > 360:
+        if not 10 <= limit <= 4500 or not 12 <= duty <= 4095 or not 100 <= timeout <= 30000 or abs(offset) > 36000:
             raise ValueError("force-feedback limit, duty, timeout or offset outside range")
         return f"sync force {peer} {stiffness:g} {damping:g} {reflection:g} {limit:g} {duty} {timeout} {offset:g}"
     busaddr = re.fullmatch(r"busaddr\s+([1-9]\d?|1\d\d|2[0-4]\d|25[0-4])", command)
@@ -739,7 +792,7 @@ def validate_command(command: str, _armed: bool = True):
             if inner != "stop":
                 raise ValueError("broadcast bus command only supports stop")
             return "bus all stop"
-        if inner in {"ping", "status", "wake", "sleep", "stop"}:
+        if inner in {"ping", "status", "wake", "sleep", "stop", "recover"}:
             return f"bus {int(destination)} {inner}"
         if inner == "arm":
             return f"bus {int(destination)} arm"
@@ -792,6 +845,8 @@ def validate_command(command: str, _armed: bool = True):
     number = r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
     if command == "cascade electrical":
         return command
+    if command == "cascade save_outer":
+        return command  # Firmware requires STOP + sleep before NVS writes.
     electrical = re.fullmatch(
         rf"cascade\s+electrical\s+{number}\s+{number}\s+{number}\s+{number}\s+{number}", command
     )
@@ -927,6 +982,85 @@ def validate_command(command: str, _armed: bool = True):
     return f"{match.group(1)} {duty} {duration}"
 
 
+def remote_force_command(body, remote_meta, peer_meta):
+    """Build the only force command allowed through a DATA gateway.
+
+    The browser supplies typed parameters, never an arbitrary remote command.
+    Both peer identities and the lower board current ceiling are checked here.
+    """
+    try:
+        def exact_int(name):
+            raw = float(body.get(name, float('nan')))
+            if not math.isfinite(raw) or not raw.is_integer():
+                raise ValueError(name + ' 必须是整数')
+            return int(raw)
+        peer = exact_int('peer')
+        stiffness = float(body.get('stiffness', float('nan')))
+        damping = float(body.get('damping', float('nan')))
+        reflection = float(body.get('reflection', float('nan')))
+        limit = float(body.get('limit', float('nan')))
+        duty = exact_int('duty')
+        timeout = exact_int('timeout')
+        offset = float(body.get('offset', float('nan')))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError('力反馈参数格式无效') from exc
+    if (remote_meta.get('protocol') != 3 or peer_meta.get('protocol') != 3 or
+            not math.isfinite(remote_meta.get('model_ke', float('nan'))) or
+            remote_meta['model_ke'] <= 0 or
+            not math.isfinite(peer_meta.get('model_ke', float('nan'))) or
+            peer_meta['model_ke'] <= 0):
+        raise ValueError('单 USB 力反馈需要两板协议 3 和有效 Ke 参数；请更新固件')
+    if peer == remote_meta.get('address') or peer != peer_meta.get('address'):
+        raise ValueError('力反馈对端地址与已核实的本机板不匹配')
+    if not math.isfinite(remote_meta.get('gear', float('nan'))) or not math.isfinite(peer_meta.get('gear', float('nan'))):
+        raise ValueError('缺少力反馈减速比')
+    if abs(remote_meta['gear'] - peer_meta['gear']) > 0.01:
+        raise ValueError('两板减速比不一致')
+    currents = (remote_meta.get('current_limit'), peer_meta.get('current_limit'))
+    if not all(isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+               for value in currents):
+        raise ValueError('缺少有效的两板电流上限')
+    max_limit = min(currents) * 800.0
+    if not math.isfinite(limit) or limit > max_limit:
+        raise ValueError('力反馈电流限制超过两板共同的 80% 上限')
+    command = (f'sync force {peer} {stiffness:g} {damping:g} {reflection:g} '
+               f'{limit:g} {duty} {timeout} {offset:g}')
+    return validate_command(command)
+
+
+def parse_chain_status(reply, address):
+    """Parse the fixed 13-field STATUS frame without accepting partial data."""
+    fields = reply.split(',') if isinstance(reply, str) else []
+    if (len(fields) != 13 or fields[0] != 'STATUS' or
+            not fields[1].isdigit() or int(fields[1]) != int(address)):
+        raise ValueError('DATA 状态帧无效')
+    try:
+        values = [float(value) for value in fields[1:]]
+    except ValueError as exc:
+        raise ValueError('DATA 状态帧包含非数字字段') from exc
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError('DATA 状态帧包含非有限值')
+    # STATUS,address,position,single,bus,current,pwm,fault,awake,...
+    if values[6] not in (0, 1):
+        raise ValueError('DATA 状态帧 nFAULT 标记无效')
+    return values
+
+
+def parse_usb_status(reply):
+    """Extract only the live power/fault/awake interlocks from USB STATUS."""
+    if not isinstance(reply, str) or not reply.startswith('STATUS '):
+        raise ValueError('本机 USB 状态回读无效')
+    bus = re.search(r'\bbus=([+-]?(?:\d+(?:\.\d*)?|\.\d+))V\b', reply)
+    fault = re.search(r'\bnFAULT=(\d+)\b', reply)
+    awake = re.search(r'\bawake=(\d+)\b', reply)
+    if not bus or not fault or not awake:
+        raise ValueError('本机 USB 状态缺少电压/驱动/nFAULT 字段')
+    bus_v = float(bus.group(1))
+    if not math.isfinite(bus_v) or int(fault.group(1)) not in (0, 1) or int(awake.group(1)) not in (0, 1):
+        raise ValueError('本机 USB 状态字段无效')
+    return {'bus':bus_v,'fault':int(fault.group(1)),'awake':int(awake.group(1))}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -966,6 +1100,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == '/api/chain/topology':
+            return self.send_json({'devices':topology.snapshot()})
+        if parsed.path == "/api/capabilities":
+            return self.send_json({'phone_handoff': True})
         if parsed.path == "/favicon.ico":
             self.send_response(204)
             self.send_header("Content-Length", "0")
@@ -1002,6 +1140,10 @@ class Handler(BaseHTTPRequestHandler):
             except (ConnectionError, OSError):
                 return
         static_files = {
+            "/chain-panel.js": ("chain-panel.js", "text/javascript; charset=utf-8"),
+            "/gateway-transport.js": ("gateway-transport.js", "text/javascript; charset=utf-8"),
+            "/remote-motion-lease.js": ("remote-motion-lease.js", "text/javascript; charset=utf-8"),
+            "/usb-chain-transport.js": ("usb-chain-transport.js", "text/javascript; charset=utf-8"),
             "/": ("dashboard.html", "text/html; charset=utf-8"),
             "/index.html": ("dashboard.html", "text/html; charset=utf-8"),
             "/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
@@ -1025,6 +1167,175 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self.read_json()
             port = str(body.get("port", "")).upper()
+            if parsed.path == '/api/chain/assign-id':
+                live=[]
+                for item in list_ports.comports():
+                    if item.vid==0x303A and not recovery_usb(item):
+                        s=get_session(item.device)
+                        if s.health().get('telemetry_ok') and not s.phone_control: live.append(s)
+                result = topology.assign(live,port,body.get('session_id'),body.get('uid'),body.get('address'))
+                # An ID reassignment changes which UID answers at an address;
+                # discard any per-address META/awake hints before the next
+                # control request can consult them.
+                for session in live:
+                    session.chain.invalidate_cache()
+                return self.send_json(result)
+            if parsed.path == '/api/chain/scan':
+                session = get_session(port)
+                identity = body.get('session_id')
+                if not identity: raise ValueError('必须提供当前 USB session_id')
+                result = session.chain.scan(identity, int(body.get('first', 1)), int(body.get('last', 254)))
+                topology.remember([(d['uid'],d['address']) for d in result['devices'] if d['uid'] in topology.devices])
+                return self.send_json({'ok': True, **result})
+            if parsed.path == '/api/chain/query':
+                session = get_session(port)
+                identity = body.get('session_id')
+                if not identity: raise ValueError('必须提供当前 USB session_id')
+                command = str(body.get('command', 'status'))
+                # Stage 1 is read-only until identity, retry and lease tests pass.
+                if command not in {'ping', 'status', 'gatewayinfo', 'sync status'}: raise ValueError('不支持的网关查询')
+                address = int(body.get('address', 0))
+                result = (session.chain.metadata(address, identity,
+                                                 expected_epoch=session.command_epoch)
+                          if command == 'gatewayinfo' else
+                          session.chain.request(address, command, identity))
+                return self.send_json({'ok': True, **result})
+            if parsed.path == '/api/chain/stop':
+                session=get_session(port)
+                identity=body.get('session_id')
+                if not identity: raise ValueError('必须提供当前 USB session_id')
+                # STOP bypasses the transaction wait; cancellation precedes broadcast.
+                session.send('stop',expected_session_id=identity)
+                session.send('bus all stop',expected_session_id=identity)
+                return self.send_json({'ok':True,'acknowledged':False,'note':'全链 STOP 已发送，需回读确认'})
+            if parsed.path == '/api/chain/control':
+                session=get_session(port)
+                identity=body.get('session_id')
+                if not identity: raise ValueError('必须提供当前 USB session_id')
+                address=int(body.get('address',0))
+                epoch=session.command_epoch
+                # Identity is still checked before every *new* session/epoch,
+                # but repeated slider updates reuse the short-lived, scoped
+                # META result.  This removes a full DATA transaction from the
+                # 25 ms motion dispatch path while keeping UID validation.
+                meta=session.chain.metadata(address,identity,expected_epoch=epoch)
+                if meta['uid'] != str(body.get('uid','')).upper(): raise ValueError('远端 UID 已变化；未执行')
+                mode=str(body.get('mode',''))
+                if mode in {'stop','sleep','recover','wake','sync_stop'}:
+                    was_awake = session.chain.remote_awake(
+                        address, identity, expected_epoch=epoch)
+                    command = 'sync stop' if mode == 'sync_stop' else mode
+                    result=session.chain.request(address,command,identity,expected_epoch=epoch)
+                    if mode == 'sleep':
+                        session.chain.mark_asleep(address,identity,expected_epoch=epoch)
+                    elif mode == 'wake':
+                        session.chain.mark_awake(address,identity,expected_epoch=epoch)
+                    elif mode == 'stop':
+                        # STOP does not report or change the driver's wake
+                        # state. Preserve only a positive hint established by
+                        # an earlier acknowledged wake/motion; an unknown or
+                        # sleeping board must not be marked awake by STOP.
+                        session.chain.mark_stopped(
+                            address, identity, expected_epoch=epoch,
+                            previously_awake=was_awake)
+                    return self.send_json({'ok':True,'accepted':True,**result})
+                if mode == 'sync_force':
+                    peer = int(body.get('peer', 0))
+                    # The peer is the board physically attached to this USB
+                    # session. Read it over USB rather than addressing the
+                    # gateway's own half-duplex DATA receiver (which may not
+                    # see its own transmitted frames).
+                    local_bus_reply = session.send_checked(
+                        'businfo', expected_session_id=identity)
+                    local_uid, local_address = topology.observe(local_bus_reply)
+                    if local_address != peer:
+                        raise ValueError('力反馈对端地址不是当前 USB 本机板')
+                    local_fw_reply = session.send_checked(
+                        'model', expected_session_id=identity)
+                    firmware = re.search(r'\bfw=([^\s]+)', local_fw_reply)
+                    model_ke = re.search(r'\bKe=([0-9.eE+-]+)V/', local_fw_reply)
+                    if not firmware or firmware.group(1) != '0.5.10-single-usb-force' or not model_ke:
+                        raise ValueError('本机 USB 板需要 0.5.10 单 USB 力反馈固件')
+                    local_profile_reply = session.send_checked(
+                        'motorprofile status', expected_session_id=identity)
+                    local_gear = re.search(r'\bgear=([0-9.eE+-]+)', local_profile_reply)
+                    local_current = re.search(r'\bcurrent_limit=([0-9.eE+-]+)A', local_profile_reply)
+                    if not local_gear or not local_current:
+                        raise ValueError('本机电机减速比/电流上限回读不完整')
+                    peer_meta = {
+                        'address':local_address,'uid':local_uid,'protocol':3,
+                        'gear':float(local_gear.group(1)),
+                        'current_limit':float(local_current.group(1)),
+                        'model_ke':float(model_ke.group(1)),
+                    }
+                    remote_status = parse_chain_status(
+                        session.chain.request(address, 'status', identity,
+                                              expected_epoch=epoch).get('reply'), address)
+                    peer_status = parse_usb_status(session.send_checked(
+                        'status', expected_session_id=identity))
+                    if not 8 <= remote_status[3] <= 50:
+                        raise ValueError('远端母线电压不在 8–50 V 范围')
+                    if remote_status[6] != 1 or remote_status[7] != 1:
+                        raise ValueError('远端驱动未就绪或 nFAULT 异常；未启动力反馈')
+                    if not 8 <= peer_status['bus'] <= 50:
+                        raise ValueError('本机母线电压不在 8–50 V 范围')
+                    if peer_status['fault'] != 1 or peer_status['awake'] != 1:
+                        raise ValueError('本机驱动未就绪或 nFAULT 异常；未启动力反馈')
+                    if not session.chain.remote_awake(address, identity,
+                                                      expected_epoch=epoch):
+                        session.chain.mark_awake(address, identity,
+                                                  expected_epoch=epoch)
+                    command = remote_force_command(body, meta, peer_meta)
+                    result = session.chain.request(address, command, identity,
+                                                   expected_epoch=epoch)
+                    return self.send_json({'ok': True, 'accepted': True, **result})
+                value=float(body.get('value',0))
+                if not math.isfinite(value): raise ValueError('无效目标')
+                if mode=='position' and abs(value)<=10: command=f'posout {value*360:.6f} 4095 1000'
+                elif mode=='velocity' and abs(value)<=15: command=f'velocity {value*360*meta["gear"]:.6f} 4095 1000'
+                elif mode=='current' and abs(value)<=min(1,meta['current_limit']*.8): command=f'current {value*1000:.3f} 4095 1000'
+                elif mode=='pwm' and abs(value)<=4095:
+                    command='stop' if abs(value)<12 else f'{"cw" if value>0 else "ccw"} {int(abs(value))} 1000'
+                else: raise ValueError('目标范围：±10圈、±15圈/秒、电流不超过1A或板端80%上限')
+                validate_command(command)
+                if not session.chain.remote_awake(address,identity,expected_epoch=epoch):
+                    session.chain.request(address,'wake',identity,expected_epoch=epoch)
+                    session.chain.mark_awake(address,identity,expected_epoch=epoch)
+                try:
+                    result=session.chain.request(address,command,identity,expected_epoch=epoch)
+                    session.chain.mark_awake(address,identity,expected_epoch=epoch)
+                except Exception:
+                    # Keep the next update able to perform a fresh wake.  Do
+                    # not blindly wake/retry a rejected target: the board may
+                    # have rejected it for power/fault/limit reasons, and a
+                    # duplicate retry could hide that diagnosis.
+                    session.chain.mark_asleep(address,identity,expected_epoch=epoch)
+                    session.send('bus all stop',expected_session_id=identity)
+                    raise
+                return self.send_json({'ok':True,'accepted':True,**result})
+            if parsed.path == "/api/phone-control":
+                session = get_session(port)
+                with session.recover_lock:
+                    if body.get('release') is True:
+                        with session.lifecycle_lock:
+                            session.phone_control = True
+                        try:
+                            for command in ('stop', 'sync off', 'sleep'):
+                                session.send_checked(command)
+                            session.disconnect('phone control handoff')
+                        except Exception:
+                            with session.lifecycle_lock:
+                                session.phone_control = False
+                            raise
+                        return self.send_json({'ok': True, 'note': '已停止并释放串口；手机可连接热点控制。后台重启需重新交接。'})
+                    if body.get('release') is not False:
+                        raise ValueError('release must be true or false')
+                    with session.lifecycle_lock:
+                        session.phone_control = False
+                    session.connect()
+                    session.send_checked('stop')
+                    session.send_checked('sleep')
+                    return self.send_json({'ok': True, 'note': '已接回电脑，保持停止'})
             if parsed.path == "/api/connect":
                 get_session(port).connect()
                 return self.send_json({"ok": True, "port": port})

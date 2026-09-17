@@ -1,5 +1,19 @@
+const {remoteMotionLeaseAction}=await import('/remote-motion-lease.js');
 const $ = (selector, root = document) => root.querySelector(selector);
 const boards = new Map();
+const wifiTransport=globalThis.MOTOR_GATEWAY ? new (await import('/gateway-transport.js')).GatewayTransport(globalThis.MOTOR_GATEWAY) : null;
+const usbChain=wifiTransport?null:new (await import('/usb-chain-transport.js')).UsbChainTransport(rawApi);
+if(!wifiTransport)fetch('/api/capabilities').then(r=>r.ok?r.json():{}).then(c=>{
+  if(c.phone_handoff){const button=document.querySelector('#phoneRelease');button.disabled=false;button.textContent='交给手机';button.title='先停止并释放串口；不自动启动手机控制';}
+}).catch(()=>{});
+// Optional module: an older running backend must not break the main dashboard.
+fetch('/chain-panel.js?v=chain-panel-recover-20260916').then(async response=>{
+  if(!response.ok)return;
+  const {installChainPanel}=await import('/chain-panel.js?v=chain-panel-recover-20260916');
+  installChainPanel({api,boards});
+  const button=document.querySelector('#chainOpen');
+  button.disabled=false;button.textContent='总线设备';button.title='远端控制需协议2固件';
+}).catch(()=>{});
 const focusedPort = (new URLSearchParams(location.search).get('focus') || '').toUpperCase();
 let displayUnit = 'rev';
 let lastModalKey = '';
@@ -9,6 +23,15 @@ const issueShownAt = new Map();
 let forceOperation = Promise.resolve();
 const forceSession = { active: false, boards: [], token: 0 };
 const autoTune = { active: false, cancelled: false, reports: [] };
+
+// A missing/broken USB CDC endpoint is a transport condition, not a reason
+// to hammer Windows with an open attempt every polling cycle. Keep retries
+// quick at first, then back off to a bounded one-minute cadence. A user
+// pressing Connect explicitly resets this state below.
+function connectBackoffMs(failures) {
+  const n = Math.max(1, Math.min(7, Number(failures) || 1));
+  return Math.min(60000, 1000 * (2 ** (n - 1)));
+}
 
 function forceState(text, className = '') {
   const state = $('#forceState');
@@ -169,6 +192,13 @@ $('#errorRecover').addEventListener('click', async () => {
 });
 
 async function api(path, body, timeoutMs = path === 'recover-link' ? 10000 : 5000) {
+  if(wifiTransport)return wifiTransport.api(path,body);
+  const port=body?.port||new URLSearchParams(path.split('?')[1]||'').get('port');
+  if(usbChain&&(usbChain.owns(port)||port?.startsWith('DATA-')))return usbChain.api(path,body);
+  const result=await rawApi(path,body,timeoutMs);
+  return path==='ports'&&usbChain?usbChain.ports(result):result;
+}
+async function rawApi(path, body, timeoutMs=5000, keepalive=false) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const options = body ? {
@@ -176,7 +206,8 @@ async function api(path, body, timeoutMs = path === 'recover-link' ? 10000 : 500
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body)
   } : {};
-  options.signal = controller.signal;
+  if(keepalive)options.keepalive=true;
+  else options.signal = controller.signal;
   try {
     const response = await fetch('/api/' + path, options);
     const result = await response.json();
@@ -233,6 +264,9 @@ function initialBoard(port) {
     seq: 0,
     polling: false,
     connecting: false,
+    connectFailures: 0,
+    nextConnectAttemptAt: 0,
+    connectionError: '',
     samples: [],
     latest: {},
     timers: {},
@@ -311,7 +345,8 @@ function refreshWindowLabels(board) {
 
 function configureTargetWindows(board) {
   const gear = gearOf(board);
-  const speedLimit = (board.motorProfile === '36gp555' ? 48000 : board.motorProfile === '25ga370' ? 4200 : 60000) / gear;
+  const speedLimit = board.motorProfile === '36gp555' ? 5400 :
+    (board.motorProfile === '25ga370' ? 4200 : 60000) / gear;
   const positionLimit = board.outputPosition ? 36000 : 36000 / gear;
   const currentLimit = board.motorProfile === '775' ? 7000 : 2000;
   const options = {
@@ -325,7 +360,9 @@ function configureTargetWindows(board) {
     select.replaceChildren(...[...new Set(widths)].map(width => {
       const option = document.createElement('option'); option.value = width; return option;
     }));
-    select.value = name === 'positionTarget' ? 180 : name === 'currentTarget' ? 500 : widths[1];
+    select.value = name === 'positionTarget' ? 180 : name === 'currentTarget' ? 500 :
+      name === 'velocityTarget' && board.motorProfile === '36gp555'
+        ? widths[widths.length - 1] : widths[1];
     setTargetWindow(board, name, Number(select.value));
   });
   refreshWindowLabels(board);
@@ -482,6 +519,16 @@ function ensureBoard(info) {
   }
   const wasActive = board.active;
   board.active = Boolean(info.active);
+  board.remote=Boolean(info.remote);board.entry=info.entry;
+  if(board.remote){
+    if(Number.isInteger(info.address))board.busAddress=info.address;
+    if(Number.isFinite(info.gear)&&info.gear>=1)board.gear=info.gear;
+    if(Number.isFinite(info.model_ke)&&info.model_ke>0)board.modelKe=info.model_ke;
+    if(Number.isFinite(info.current_limit)&&info.current_limit>0)
+      board.motorSettings={...(board.motorSettings||{}),current:info.current_limit,gear:info.gear};
+    board.gatewayProtocol=info.protocol;
+  }
+  board.phoneControl=Boolean(info.phone_control);
   board.writeOk = Boolean(info.write_ok);
   board.hwid = info.hwid || info.description || '';
   board.rxAgeMs = info.rx_age_ms;
@@ -490,6 +537,21 @@ function ensureBoard(info) {
     board.noTelemetryWarned = false;
   }
   if (!wasActive && board.active) {
+    // A USB reconnect starts a new command session.  Do not carry a queued
+    // slider value, ACK transaction, or lease from the previous handle into
+    // the new one; the backend also sends an unconditional STOP during its
+    // monitor handshake.  This is deliberately done even when the port
+    // number is unchanged because Windows can replace a CDC handle in place.
+    const hadMotionState = board.activeMotion !== undefined ||
+      board.pendingMotion !== undefined || board.motionFlushing !== undefined;
+    if (hadMotionState) {
+      if (board.activeMotion || board.pendingMotion || board.motionFlushing) clearMotionTimers(board);
+      board.pendingMotion = null;
+      board.activeMotion = null;
+    }
+    board.connectFailures = 0;
+    board.nextConnectAttemptAt = 0;
+    board.connectionError = '';
     board.configApplied = false;
     board.driverReady = false;
     board.noTelemetryWarned = false;
@@ -504,7 +566,11 @@ function ensureBoard(info) {
     board.activeMotion = null;
   }
   $('.dot', board.root).classList.toggle('on', board.active && board.writeOk);
-  const linkText = !board.active ? '未连接' : !board.writeOk
+  const retryWait = !board.active && board.connectionError &&
+    board.nextConnectAttemptAt > Date.now()
+    ? '（' + board.connectionError + '；' +
+      Math.ceil((board.nextConnectAttemptAt - Date.now()) / 1000) + ' s 后重试）' : '';
+  const linkText = !board.active ? '未连接' + retryWait : !board.writeOk
     ? '已枚举 · CDC 写端点异常'
     : info.rx_age_ms === null
       ? '已连接 · 等待首帧'
@@ -550,23 +616,29 @@ function applyMotorProfileUi(board, profile, gear = profile === '36gp555' ? 5.2 
     const hasBus = Number.isFinite(board.latest.bus) && board.latest.bus >= 2;
     const bus = hasBus ? board.latest.bus : 20.0;
     const voltagePwm = clamp(Math.floor(25.2 / bus * 4095), 1, 4095);
-    setSliderRange(board, 'velocityTarget', -48000, 48000, 10, 0);
+    setSliderRange(board, 'velocityTarget', -5400, 5400, 10, 0);
+    // The UI value is output-shaft deg/s; the board command is motor-shaft
+    // deg/s and is multiplied by the gear ratio before sending.  Use the
+    // requested 15 r/s test ceiling (5400 output deg/s = 28080 motor deg/s).
+    // The 18,000
+    // deg/s² acceleration envelope and measured-current limit still decide
+    // the attainable speed on the user's 20 V / 65 W supply.
     setSliderRange(board, 'positionMaxVelocity', 100, 5400, 100, 5400);
     setSliderRange(board, 'positionMinVelocity', 0, 48000, 100, 0);
     setSliderRange(board, 'currentTarget', -2000, 2000, 10, 0);
     setSliderRange(board, 'velocityMaxCurrent', 0.05, 2, 0.05, (board.motorSettings?.current ?? 1.5)*0.8);
     setSliderRange(board, 'velocityFriction', 0, 2, 0.01, 0);
     setSliderRange(board, 'positionLowSpeedCurrent', 0, 2, 0.01, 0);
-    setSliderRange(board, 'positionDeadband', 0.05, 10, 0.05, 0.10);
+    setSliderRange(board, 'positionDeadband', 0.05, 10, 0.05, 0.25);
     setSlider(board, 'currentKp', 600);
     setSlider(board, 'currentKi', 600000);
     setSlider(board, 'currentMaxPwm', 4095);
-    setSlider(board, 'velocityKp', 0.0008);
-    setSlider(board, 'velocityKi', 0.016);
+    setSlider(board, 'velocityKp', 0.0004);
+    setSlider(board, 'velocityKi', 0.008);
     setSlider(board, 'positionKp', 12);
     setSlider(board, 'positionKi', 0);
     setSlider(board, 'positionKd', 0.15);
-    setSlider(board, 'positionDeadband', 0.10);
+    setSlider(board, 'positionDeadband', 0.25);
     board.velocityCurrentSlew = 80;
     board.velocityBrakeSlew = 1;
     setSlider(board, 'openPwm', 205);
@@ -782,9 +854,9 @@ async function applyCascade(board, notify = true) {
   if (notify) toast(board.port + ': 三环参数已应用');
 }
 
-async function ensureReady(board) {
+async function ensureReady(board, configureCascade = true) {
   if (board.rearmPromise) await board.rearmPromise;
-  if (!board.configApplied) await applyCascade(board, false);
+  if (configureCascade && !board.configApplied) await applyCascade(board, false);
   // driverReady is refreshed by every telemetry frame. Do not let a stale
   // pre-WAKE frame trigger a second reset while motion is starting.
   if (!board.driverReady) {
@@ -810,6 +882,7 @@ async function stopAndPrepare(board) {
   const rearm = (async () => {
     if (previous) await previous.catch(() => {});
     await send(board.port, 'stop');
+    if(board.remote||wifiTransport)return;
     await send(board.port, 'wake');
     await pause(50);
     if (board.active && generation === board.motionGeneration) board.driverReady = true;
@@ -823,11 +896,11 @@ async function stopAndPrepare(board) {
 }
 
 async function runMotion(board, mode, value, generation = board.motionGeneration) {
-  if (forceSession.active || $('#forceStart').disabled) throw new Error('请先停止双板力反馈，再使用单轴控制');
+  if (forceSession.active || (!wifiTransport && $('#forceStart').disabled && !$('#forceStart').dataset.remoteDisabled)) throw new Error('请先停止双板力反馈，再使用单轴控制');
   if (!board.active) return;
   gearOf(board);
   if (generation !== board.motionGeneration) return;
-  if (!board.lastTelemetryAt || Date.now() - board.lastTelemetryAt > 500) {
+  if (!board.lastTelemetryAt || Date.now() - board.lastTelemetryAt > ((wifiTransport||board.remote)?2000:500)) {
     throw new Error(board.port + ': 角度/电流遥测已过期，未执行动作');
   }
   if (board.powerFault) {
@@ -844,24 +917,64 @@ async function runMotion(board, mode, value, generation = board.motionGeneration
   if (!board.latest.fault) {
     throw new Error(board.port + ': nFAULT=0，未执行动作');
   }
-  if (board.activeMotion?.mode === 'knob') { board.activeMotion = null; await send(board.port, 'stop'); }
-  await ensureReady(board);
-  if (generation !== board.motionGeneration) return;
-  const timeoutMs = mode === 'velocity'
+  const timeoutMs = mode === 'pwm' ? 1000 : mode === 'velocity'
     ? Math.round(clamp(valueOf(board, 'velocityDuration'), 0.1, 30) * 1000)
     : mode === 'current'
       ? Math.round(clamp(valueOf(board, 'currentDuration'), 0.1, 10) * 1000)
       : 30000;
+  if(wifiTransport||board.remote){
+    await (wifiTransport||usbChain).motion(board.port,mode,value);
+    const now=Date.now();
+    const leaseMs=wifiTransport?1000:timeoutMs;
+    board.activeMotion={mode,value,timeoutMs:leaseMs,
+      expiresAt:mode==='position'&&!wifiTransport?Number.POSITIVE_INFINITY:now+leaseMs};
+    board.lastMotionSentAt=now;return;
+  }
+  if (board.activeMotion?.mode === 'knob') { board.activeMotion = null; await send(board.port, 'stop'); }
+  await ensureReady(board, mode !== 'pwm');
+  if (generation !== board.motionGeneration) return;
   value = Number(value.toFixed(mode === 'position' ? 3 : 2));
   if (mode === 'position') await send(board.port, positionCommand(board, value, timeoutMs));
   if (mode === 'velocity') await send(board.port, 'velocity ' + serialNumber(value * gearOf(board)) + ' 4095 ' + timeoutMs);
   if (mode === 'current') await send(board.port, 'current ' + value + ' 4095 ' + timeoutMs);
+  if (mode === 'pwm') {
+    value = Math.round(clamp(value, -4095, 4095));
+    await send(board.port, value === 0 ? 'stop' : (value > 0 ? 'cw ' : 'ccw ') + Math.abs(value) + ' ' + timeoutMs);
+  }
   if (generation !== board.motionGeneration || !board.active) return;
   board.activeMotion = { mode, value, timeoutMs };
   board.lastMotionSentAt = Date.now();
 }
 
 async function renewMotion(board) {
+  if(wifiTransport){if(board.activeMotion&&Date.now()-board.lastMotionSentAt>1000)board.activeMotion=null;return;}
+  if(board.remote){
+    const motion=board.activeMotion;
+    const now=Date.now();
+    const action=remoteMotionLeaseAction(motion,now,board.lastMotionSentAt,board.lastTelemetryAt);
+    if(action==='none'||action==='wait')return;
+    if(action==='expire'||action==='stale'){
+      board.activeMotion=null;
+      await api('send',{port:board.port,command:'stop'}).catch(()=>{});
+      if(action==='stale')throw new Error(board.port+': DATA 遥测中断，远端租约已停止；请重新给目标');
+      return;
+    }
+    if(board.motionFlushing||board.pendingMotion)return;
+    board.motionFlushing=true;
+    board.lastMotionFlushAt=now;
+    try{
+      await usbChain.motion(board.port,motion.mode,motion.value);
+      if(board.activeMotion===motion)board.lastMotionSentAt=Date.now();
+    }catch(error){
+      if(board.activeMotion===motion)board.activeMotion=null;
+      await api('send',{port:board.port,command:'stop'}).catch(()=>{});
+      throw new Error(board.port+': DATA 目标续租失败，已请求 STOP：'+error.message);
+    }finally{
+      board.motionFlushing=false;
+      queueMotionFlush(board);
+    }
+    return;
+  }
   if (!board.active || !board.activeMotion) return;
   if (board.activeMotion.mode === 'knob') return renewKnob(board);
   const { mode, value, timeoutMs = 30000 } = board.activeMotion;
@@ -950,7 +1063,10 @@ async function handleAction(board, action) {
   try {
     if (action === 'knobStart') await startKnob(board);
     if (action === 'knobStop') await stopAndPrepare(board);
-    if (action === 'connect') await connectOrRecover(board.port);
+    if (action === 'connect') {
+      board.connectFailures=0;board.nextConnectAttemptAt=0;board.connectionError='';
+      await connectOrRecover(board.port);
+    }
     if (action === 'applyProfile') {
       const profile = $('[data-profile]', board.root).value;
       clearMotionTimers(board);
@@ -1161,6 +1277,49 @@ function numeric(value, fallback = 0) {
   return Number.isFinite(result) ? result : fallback;
 }
 
+function mirrorRemoteForceSample(remoteBoard, sourceBoard, sourceSample, part) {
+  if(!remoteBoard?.remote||!Number.isFinite(remoteBoard.gear)||remoteBoard.gear<1||
+     part.length<37||numeric(part[27])!==1||!sourceSample.forceActive)return false;
+  const sampleTime=Date.now()+(sourceSample.t-sourceBoard.latest.t);
+  const multi=numeric(part[28])/remoteBoard.gear;
+  const peerSample={
+    t:sampleTime,
+    single:((multi%360)+360)%360,
+    multi,
+    gear:remoteBoard.gear,
+    bus:Number.isFinite(remoteBoard.latest.bus)?remoteBoard.latest.bus:NaN,
+    current:numeric(part[30])/1000,
+    pwm:NaN,
+    pwmMagnitude:numeric(part[31]),
+    fault:numeric(part[32]),
+    awake:numeric(part[33]),
+    step:remoteBoard.latest.step??0,
+    raw:NaN,
+    velocity:numeric(part[29])/remoteBoard.gear,
+    control:1,
+    forceActive:true,
+    multiTarget:NaN,
+    phase:NaN,
+    settled:0,
+    velocityTarget:numeric(part[35])/remoteBoard.gear,
+    currentTarget:numeric(part[36])/1000
+  };
+  if(![peerSample.multi,peerSample.current,peerSample.pwmMagnitude,
+       peerSample.velocity,peerSample.fault,peerSample.awake,
+       peerSample.velocityTarget,peerSample.currentTarget].every(Number.isFinite))return false;
+  remoteBoard.latest=peerSample;
+  remoteBoard.driverReady=peerSample.awake===1;
+  remoteBoard.lastFault=peerSample.fault;
+  remoteBoard.lastAwake=peerSample.awake;
+  remoteBoard.lastTelemetryAt=sampleTime;
+  remoteBoard.lastMirrorAt=Date.now();
+  remoteBoard.samples.push(peerSample);
+  if(remoteBoard.samples.length>1200)remoteBoard.samples.splice(0,remoteBoard.samples.length-1200);
+  updateRanges(remoteBoard);
+  remoteBoard.dirty=true;
+  return true;
+}
+
 function parseLine(board, text) {
   const trace=text.match(/^T,(\d+),([+-]?[\d.]+),([+-]?[\d.]+),([+-]?[\d.]+)(?:,([+-]?[\d.]+),([+-]?[\d.]+),(\d+),([+-]?[\d.]+))?$/);
   if(trace) {
@@ -1260,6 +1419,11 @@ function parseLine(board, text) {
     if (board.samples.length > 1200) board.samples.splice(0, board.samples.length - 1200);
     updateRanges(board);
     board.dirty = true;
+    if(sample.forceActive){
+      const remoteBoard=[...boards.values()].find(candidate=>candidate.remote&&
+        candidate.entry===board.port&&candidate.active);
+      if(remoteBoard)mirrorRemoteForceSample(remoteBoard,board,sample,part);
+    }
     return;
   }
   if (text.startsWith('MODEL fw=')) {
@@ -1548,10 +1712,31 @@ function resetChartRanges(board, sample = {}) {
 
 async function pollLogs(board) {
   if (!board.active || board.polling || board.eventsLive) return;
+  // A DATA gateway is half-duplex at the transaction layer even though the
+  // underlying UART is 1 Mbaud.  While a slider update is queued/in flight,
+  // let that control transaction win instead of inserting a status query in
+  // front of it. Keep a modest 20 Hz idle scope and back off during bilateral
+  // haptics so status reads cannot compete with the 200 Hz peer exchange.
+  if (board.remote && (board.motionFlushing || board.pendingMotion)) return;
+  // During haptics, mirror the peer's already-synchronized 200 Hz state from
+  // the gateway's 50 Hz USB stream. Only fall back to DATA status reads if
+  // that mirror goes stale; this improves the scope without stealing bus slots.
+  if(board.remote&&forceSession.active&&Date.now()-(board.lastMirrorAt||0)<120)return;
+  const remotePollMs=forceSession.active?100:25;
+  if((wifiTransport||board.remote)&&Date.now()-(board.wifiPollAt||0)<(board.remote?remotePollMs:150))return;
+  board.wifiPollAt=Date.now();
   board.polling = true;
   try {
     const result = await api('logs?port=' + encodeURIComponent(board.port) + '&since=' + board.seq);
     ingestLogs(board, result);
+    if(result.gateway){
+      const d=result.gateway,f=d.fields;
+      board.gear=d.gear;board.busAddress=d.address;board.modelKe=d.model_ke||board.modelKe;
+      board.gatewayProtocol=d.protocol;board.motorProfile='gateway';board.motorSettings={current:d.limit,gear:d.gear};
+      board.targetLimits={positionTarget:3600,velocityTarget:5400,currentTarget:Math.min(1000,d.limit*800)};
+      const s={t:d.time,multi:f[3]/d.gear,single:f[2]/d.gear,bus:f[4],current:f[5]/1000,pwm:NaN,pwmMagnitude:f[6],fault:f[7],awake:f[8],step:f[9],velocity:f[10]/d.gear,control:f[11],multiTarget:[3,5].includes(f[11])?f[12]/d.gear:NaN,velocityTarget:f[11]===2?f[12]/d.gear:NaN,currentTarget:f[11]===1?f[12]/1000:NaN};
+      board.latest=s;board.driverReady=s.awake===1;board.samples.push(s);while(board.samples.length>500)board.samples.shift();board.lastTelemetryAt=Date.now();board.dirty=true;
+    }
   } catch (_) {
     board.active = false;
   } finally {
@@ -1608,7 +1793,11 @@ async function refreshPorts() {
   portRefreshInFlight = true;
   try {
     const result = await api('ports');
-    const ports = result.ports.filter(port => port.esp32).sort((a, b) => {
+    // Old backends do not expose recovery_usb yet. Recognize this project's
+    // hardware USB transport without sending probe commands to the ROM port.
+    const recoveryPorts = result.ports.filter(port => port.esp32 &&
+      (port.recovery_usb || /VID:PID=303A:1001.*SER=(?:[0-9a-f]{2}:){5}[0-9a-f]{2}(?:\s|$)/i.test(port.hwid || '')));
+    const ports = result.ports.filter(port => port.esp32 && !recoveryPorts.includes(port)).sort((a, b) => {
       const af = a.port.toUpperCase() === focusedPort ? 0 : 1;
       const bf = b.port.toUpperCase() === focusedPort ? 0 : 1;
       return af - bf || a.port.localeCompare(b.port, undefined, { numeric: true });
@@ -1627,7 +1816,7 @@ async function refreshPorts() {
     });
     ports.forEach(info => {
       const board = ensureBoard(info);
-      if (info.active && !board.motorProfile && !board.queryingProfile) {
+      if (!wifiTransport && !info.remote && info.active && !board.motorProfile && !board.queryingProfile) {
         board.queryingProfile = true;
         (async () => {
           await send(board.port, 'model');
@@ -1636,7 +1825,7 @@ async function refreshPorts() {
           await send(board.port, 'knob status');
         })().catch(() => {}).finally(() => { board.queryingProfile = false; });
       }
-      if (!board.events) {
+      if (!wifiTransport && !info.remote && !board.events) {
         const source = new EventSource('/api/events?port=' + encodeURIComponent(board.port) + '&since=' + board.seq);
         board.events = source;
         source.onmessage = event => {
@@ -1646,9 +1835,19 @@ async function refreshPorts() {
         };
         source.onerror = () => { board.eventsLive = false; };
       }
-      if (!info.active && !board.connecting && !info.maintenance) {
+      if (!info.active && !board.connecting && !info.maintenance && Date.now()>(board.nextConnectAttemptAt||0)) {
         board.connecting = true;
-        api('connect', { port: info.port }).catch(() => {}).finally(() => { board.connecting = false; });
+        api('connect', { port: info.port }).then(()=>{
+          board.connectFailures = 0;
+          board.nextConnectAttemptAt = 0;
+          board.connectionError = '';
+        }).catch(error => {
+          board.connectFailures = Math.min(7, (board.connectFailures || 0) + 1);
+          board.nextConnectAttemptAt = Date.now() + connectBackoffMs(board.connectFailures);
+          board.connectionError=error.message;
+          $('[data-connected]',board.root).textContent='连接失败：'+error.message +
+            '；' + Math.ceil((board.nextConnectAttemptAt-Date.now())/1000) + ' s 后重试';
+        }).finally(() => { board.connecting = false; });
       }
       // null means the CDC reader has not delivered its first frame yet. It
       // is a startup state, not proof of a dead link. The old check used only
@@ -1672,6 +1871,10 @@ async function refreshPorts() {
     $('#portSummary').textContent = ports.length ?
       ports.map(port => port.port + (port.active ? (port.telemetry_ok ? ' 已连接' : ' 等待遥测') : ' 正在连接')).join(' · ') :
       '未发现 ESP32 USB 串口';
+    if (recoveryPorts.length) {
+      $('#portSummary').textContent += ' · ' + recoveryPorts.map(port => port.port).join('、') +
+        ' USB 恢复/调试接口（不是正常电机端口，已跳过自动连接）';
+    }
     if (!ports.length && result.usb_problems?.length) {
       $('#portSummary').textContent += ' · USB 枚举错误，请检查设备管理器；不能通过不存在的 COM 口烧录';
     }
@@ -1750,8 +1953,11 @@ function axisRange(board, key) {
 
 function nice(value, tick = 1) {
   // Tick spacing, not the absolute angle, determines useful precision.
-  const digits = clamp(Math.ceil(-Math.log10(Math.max(Math.abs(tick), 1e-7))) + 1, 0, 7);
-  return fmt(value);
+  const digits = clamp(Math.max(2,
+    Math.ceil(-Math.log10(Math.max(Math.abs(tick), 1e-7))) + 1), 2, 7);
+  if (!Number.isFinite(value)) return '—';
+  const rounded = Number(value.toFixed(digits));
+  return Object.is(rounded, -0) ? (0).toFixed(digits) : rounded.toFixed(digits);
 }
 
 function drawChart(board, key, canvas) {
@@ -1854,9 +2060,25 @@ function scopeRange(values,floor) {
   const lo=Math.min(...finite),hi=Math.max(...finite),span=Math.max(floor,hi-lo);
   return [(lo+hi)/2-span*.65,(lo+hi)/2+span*.65];
 }
+// Display-only causal low-pass. Preserve telemetry, targets and exports.
+// Time-based coefficients make replay independent of rendering frame rate.
+function scopeDisplaySamples(samples, enabled) {
+  if(!enabled)return samples;
+  let previous=null;
+  return samples.map(raw=>{
+    const sample={...raw},dt=previous?raw.t-previous.t:0;
+    for(const [key,tauMs] of [['velocity',30],['current',20]]) {
+      sample[key+'Raw']=raw[key];
+      if(previous && dt>0 && dt<=100 && Number.isFinite(previous[key]) && Number.isFinite(raw[key]))
+        sample[key]=previous[key]+(-Math.expm1(-dt/tauMs))*(raw[key]-previous[key]);
+    }
+    previous=sample;
+    return sample;
+  });
+}
 function scopeSnapshot() {
   return {end:Date.now(),series:[...boards.values()].filter(b=>b.active).map(b=>({
-    port:b.port,session:b.sessionId,samples:b.samples.map(s=>({...s,multi:s.multi/360,velocity:s.velocity/360,multiTarget:s.multiTarget/360,velocityTarget:s.velocityTarget/360,wall:b.lastTelemetryAt+s.t-b.latest.t}))
+    port:b.port,remote:b.remote,session:b.sessionId,samples:b.samples.map(s=>({...s,multi:s.multi/360,velocity:s.velocity/360,multiTarget:s.multiTarget/360,velocityTarget:s.velocityTarget/360,wall:b.lastTelemetryAt+s.t-b.latest.t}))
   }))};
 }
 function scopePaneKeys(pane) {
@@ -1894,7 +2116,7 @@ function drawScope(now) {
   const data=scope.frozen||scopeSnapshot(),windowMs=Number($('#scopeWindow').value),end=data.end-scope.offset,start=end-windowMs;
   const legends=[],readings=[];
   for(let pane=0;pane<2;pane++){
-    const top=pane*lane+30,s=data.series[pane],samples=(s?.samples||[]).filter(v=>v.wall>=start&&v.wall<=end);
+    const top=pane*lane+30,s=data.series[pane],samples=scopeDisplaySamples(s?.samples||[], $('#scopeSmooth').checked).filter(v=>v.wall>=start&&v.wall<=end);
     const title=(pane?'下窗':'上窗')+' · '+(s?.port||'等待电机');
     const keys=scopePaneKeys(pane);
     ctx.font='12px Consolas';ctx.textAlign='left';ctx.fillStyle='#b9cbd5';ctx.fillText(title,left,top-9);
@@ -1904,7 +2126,7 @@ function drawScope(now) {
     const row=document.createElement('div');row.className='scope-scale-row';const label=document.createElement('b');label.textContent=s?.port||'未连接';row.append(label);
     for(const [axisIndex,key] of keys.entries()){
       const channel=scopeChannels[key],rangeKey=(s?.port||pane)+':'+key;
-      if(!scope.ranges[rangeKey]||(!scope.locked&&!scope.manual.has(rangeKey)))scope.ranges[rangeKey]=scopeRange(samples.flatMap(v=>[v[key],scopeTarget(v,key)]),channel.floor);
+      if(!scope.ranges[rangeKey]||(!scope.locked&&!scope.manual.has(rangeKey)))scope.ranges[rangeKey]=scopeRange(samples.flatMap(v=>[v[key],v[key+'Raw'],scopeTarget(v,key)]),channel.floor);
       const [lo,hi]=scope.ranges[rangeKey];
       // Every overlaid channel owns a colored axis; units must never share
       // a misleading numeric scale. Extra channels get a second outer column.
@@ -1927,16 +2149,27 @@ function drawScope(now) {
       for(const sample of samples){
         if(!Number.isFinite(sample[key])){previous=null;continue;}
         const x=left+(sample.wall-start)/windowMs*pw,y=top+(hi-sample[key])/(hi-lo)*ph;
-        if(!previous||sample.wall-previous.wall>100)ctx.moveTo(x,y);else ctx.lineTo(x,y);previous=sample;
+        if(!previous||sample.wall-previous.wall>(wifiTransport?1500:s.remote?300:100))ctx.moveTo(x,y);else ctx.lineTo(x,y);previous=sample;
       }
       ctx.stroke();ctx.restore();
+      if($('#scopeSmooth').checked && ['velocity','current'].includes(key)) {
+        ctx.save();ctx.beginPath();ctx.rect(left,top,pw,ph);ctx.clip();
+        ctx.strokeStyle=channel.color;ctx.globalAlpha=.28;ctx.lineWidth=.8;ctx.beginPath();previous=null;
+        for(const sample of samples){
+          const value=sample[key+'Raw'];
+          if(!Number.isFinite(value)){previous=null;continue;}
+          const x=left+(sample.wall-start)/windowMs*pw,y=top+(hi-value)/(hi-lo)*ph;
+          if(!previous||sample.wall-previous.wall>(wifiTransport?1500:s.remote?300:100))ctx.moveTo(x,y);else ctx.lineTo(x,y);previous=sample;
+        }
+        ctx.stroke();ctx.restore();
+      }
       ctx.save();ctx.beginPath();ctx.rect(left,top,pw,ph);ctx.clip();ctx.strokeStyle='#ff4055';ctx.lineWidth=2.4;ctx.setLineDash([9,5]);ctx.beginPath();
       previous=null;
       for(const sample of samples){
         const target=scopeTarget(sample,key);
         if(!Number.isFinite(target)){previous=null;continue;}
         const x=left+(sample.wall-start)/windowMs*pw,y=top+(hi-target)/(hi-lo)*ph;
-        if(!previous||sample.wall-previous.wall>100)ctx.moveTo(x,y);else ctx.lineTo(x,y);previous=sample;
+        if(!previous||sample.wall-previous.wall>(wifiTransport?1500:s.remote?300:100))ctx.moveTo(x,y);else ctx.lineTo(x,y);previous=sample;
       }
       ctx.stroke();ctx.restore();
     }
@@ -1946,7 +2179,7 @@ function drawScope(now) {
       const f=Math.max(0,Math.min(1,(scope.cursor-left)/pw)),at=start+f*windowMs,x=left+f*pw;
       ctx.strokeStyle='#d5e1e5';ctx.setLineDash([2,4]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,top+ph);ctx.stroke();ctx.setLineDash([]);
       const point=samples.reduce((best,p)=>!best||Math.abs(p.wall-at)<Math.abs(best.wall-at)?p:best,null);
-      readings.push((s?.port||title)+': '+(!point||Math.abs(point.wall-at)>100?'无邻近样本':keys.map(k=>scopeChannels[k].name+' '+fmt(point[k])+' '+scopeChannels[k].unit).join(' · ')));
+      readings.push((s?.port||title)+': '+(!point||Math.abs(point.wall-at)>100?'无邻近样本':keys.map(k=>scopeChannels[k].name+' '+fmt(point[k+'Raw']??point[k])+' '+scopeChannels[k].unit).join(' · ')));
     }
   }
   ctx.font='11px Consolas';ctx.fillStyle='#839aa9';ctx.textAlign='center';
@@ -1955,7 +2188,7 @@ function drawScope(now) {
   $('#scopeViewState').textContent=(scope.frozen?'历史定格':'实时')+' · '+(windowMs/1000).toFixed(2)+' s 窗口';
   if(readings.length&&!scopeLiveForce())$('#scopeCursor').textContent=readings.join(' ｜ ');
   else $('#scopeCursor').textContent=scopeSnapshot().series.map(s=>{
-    const p=s.samples.at(-1);if(!p||Date.now()-p.wall>500)return s.port+'：数据过期';
+    const p=s.samples.at(-1);if(!p||Date.now()-p.wall>((wifiTransport||s.remote)?2000:500))return s.port+'：数据过期';
     return s.port+': '+['multi','velocity','current','pwm'].map(k=>scopeChannels[k].name+' '+fmt(p[k])+' '+scopeChannels[k].unit).join(' · ');
   }).join(' ｜ ');
 }
@@ -2024,15 +2257,29 @@ function animationFrame(now) {
 const quickModes = {
   position:{label:'位置',unit:'r',scale:360,range:10,color:'#6ed6b8'},
   velocity:{label:'速度',unit:'r/s',scale:360,range:15,color:'#e9bb72'},
-  current:{label:'电流',unit:'A',scale:1000,range:1,color:'#81b9ee'}
+  current:{label:'电流',unit:'A',scale:1000,range:1,color:'#81b9ee'},
+  pwm:{label:'PWM',unit:'%',scale:40.95,range:100,color:'#cba4df'}
 };
 let quickRun=null, quickBusy=false, quickEpoch=0, quickPending=null, quickTimer=null;
+let quickDisplayMode=null;
+function quickShowChannel(mode) {
+  const key={position:'multi',velocity:'velocity',current:'current',pwm:'pwm'}[mode];
+  if(!key)return;
+  if(quickDisplayMode===mode)return;
+  quickDisplayMode=mode;
+  document.querySelectorAll('#scopeChannels [data-scope-channel]').forEach(input=>{
+    input.checked=input.dataset.scopeChannel===key || (mode==='pwm' && input.checked);
+  });
+  $('#scopeYChannel').value=key;
+}
+quickShowChannel('position');
 function quickSchedule(mode) {
+  quickShowChannel(mode);
   quickPending=mode;
   if(quickBusy || quickTimer!==null)return;
   quickTimer=setTimeout(()=>{
     quickTimer=null;const next=quickPending;quickPending=null;
-    if(next)quickApply(next,quickRun?.mode!==next);
+    if(next)quickApply(next,quickRun?.mode!==next || quickRun.targets.some(b=>!b.activeMotion));
   },40);
 }
 function quickCancelPending() {
@@ -2050,16 +2297,16 @@ for (const [mode,c] of Object.entries(quickModes)) {
 function quickTargets() {
   const active=[...boards.values()].filter(b=>b.active),selection=$('#quickBoard').value;
   const targets=selection==='both'?active.slice(0,2):[active[Number(selection)]];
-  if(targets.some(b=>!b) || targets.length!==(selection==='both'?2:1))throw new Error('所选电机未连接；请先连接设备');
+  if(targets.some(b=>!b) || targets.length!==(selection==='both'?2:1))throw new Error(active.length===1?'仅 '+active[0].port+' 在线，请在“控制对象”选择“仅 '+active[0].port+'”；双板力反馈需两台在线。':'所选电机未连接；请先连接设备');
   return targets;
 }
-async function quickStop(preservePending=false) {
+async function quickStop(preservePending=false, owner=null) {
   if(!preservePending)quickCancelPending();
   quickEpoch++;
   const previous=quickRun;quickRun=null;
   if(previous) await Promise.all(previous.targets.map(async b=>{
     clearMotionTimers(b);b.motionGeneration++;b.activeMotion=null;
-    await send(b.port,'stop');
+    await send(b.port,'stop',owner);
   }));
 }
 async function quickApply(mode,start) {
@@ -2067,11 +2314,11 @@ async function quickApply(mode,start) {
   quickBusy=true;let targets=[],started=false;
   try {
     targets=quickTargets();
-    if(forceSession.active || $('#forceStart').disabled)throw new Error('请先停止力反馈或辨识，再进行手动测试');
+    if(forceSession.active || (!wifiTransport && $('#forceStart').disabled && !$('#forceStart').dataset.remoteDisabled))throw new Error('请先停止力反馈或辨识，再进行手动测试');
     const value=Number($('#quick-'+mode).value)*quickModes[mode].scale;
     if(!Number.isFinite(value))throw new Error('目标值无效');
     for(const b of targets) {
-      if(!b.latest || Date.now()-b.lastTelemetryAt>500)throw new Error(b.port+' 遥测过期，请重新连接');
+      if(!b.latest || Date.now()-b.lastTelemetryAt>((wifiTransport||b.remote)?2000:500))throw new Error(b.port+' 遥测过期，请重新连接');
       if(mode==='current' && (!Number.isFinite(b.motorSettings?.current) || b.motorSettings.current<=0))throw new Error(b.port+' 尚未回读有效电流上限');
       if(mode==='velocity' && Math.abs(value)>b.targetLimits.velocityTarget)throw new Error(b.port+' 速度目标超过当前电机配置范围');
     }
@@ -2084,14 +2331,21 @@ async function quickApply(mode,start) {
     const run=quickRun;
     if(!run || run.mode!==mode || targets.some((b,i)=>b!==run.targets[i] || b.sessionId!==run.sessions[i] || b.motionGeneration!==run.generations[i] || (!start && b.activeMotion?.mode!==mode)))throw new Error('测试已停止或连接已变化，请点击执行重新开始');
     started=true;
-    for(let i=0;i<targets.length;i++) {
+    // Dispatch a paired target together, not one full USB round trip apart.
+    // Wait for BOTH outcomes before rollback so a late successful ACK cannot
+    // arrive after the peer failure cleanup and leave one motor running.
+    const outcomes=await Promise.allSettled(targets.map(async (board,i)=>{
       if(quickRun!==run)throw new Error('测试已取消');
-      const target=mode==='current'?Math.max(-targets[i].motorSettings.current*800,Math.min(targets[i].motorSettings.current*800,value)):value;
-      if(mode==='position' && Math.abs(target)>targets[i].targetLimits.positionTarget)throw new Error('位置目标超出有效范围，请减小偏移');
-      await runMotion(targets[i],mode,target,run.generations[i]);
-    }
+      const target=mode==='current'?Math.max(-board.motorSettings.current*800,Math.min(board.motorSettings.current*800,value)):value;
+      if(mode==='position' && Math.abs(target)>board.targetLimits.positionTarget)throw new Error('位置目标超出有效范围，请减小偏移');
+      await runMotion(board,mode,target,run.generations[i]);
+    }));
+    const failed=outcomes.find(r=>r.status==='rejected');
+    if(failed)throw failed.reason;
+    if(quickRun!==run)throw new Error('测试已取消');
     document.querySelectorAll('.quick-row').forEach(row=>row.classList.toggle('controlling',!!row.querySelector('#quick-'+mode)));
-    $('#quickState').textContent=targets.map(b=>b.port).join(' + ')+' · 正在控制'+quickModes[mode].label+' · '+fmt(value/quickModes[mode].scale)+' '+quickModes[mode].unit+(mode==='current'&&targets.some(b=>Math.abs(value)>b.motorSettings.current*800)?'（已限幅至各板最大电流的 80%）':'');
+    $('#quickState').textContent=targets.map(b=>b.port).join(' + ')+' · 正在控制'+quickModes[mode].label+' · '+fmt(value/quickModes[mode].scale)+' '+quickModes[mode].unit+(mode==='current'&&targets.some(b=>Math.abs(value)>b.motorSettings.current*800)?'（已限幅至各板最大电流的 80%）':'')+(mode==='pwm'?' · 开环；最后更新后 1 秒归零，非恒流模式':'');
+    if(targets.some(b=>b.remote))$('#quickState').textContent+=' · DATA 目标每次更新有效 1 秒；继续拖动更新';
   } catch(error) {
     const stopped=await Promise.allSettled((started?targets:quickRun?.targets||[]).map(async b=>{clearMotionTimers(b);b.motionGeneration++;b.activeMotion=null;await send(b.port,'stop');}));
     quickCancelPending();quickRun=null;$('#quickState').textContent=error.message+(stopped.some(r=>r.status==='rejected')?'；停止指令未全部确认，请检查连接':'');
@@ -2122,14 +2376,32 @@ $('#fleetTarget').addEventListener('input', event => {
 async function connectOrRecover(port) {
   const state=(await api('ports')).ports.find(p=>p.port===port);
   if(!state?.present)throw new Error(port+' 未被系统识别，请检查 USB');
+  if(state.phone_control)return api('phone-control',{port,release:false});
   const stale=state.active && (!state.write_ok || state.last_error || (state.connected_age_ms>5000 && !state.telemetry_ok));
   return api(stale?'recover-link':'connect',{port});
 }
 $('#connectAll').addEventListener('click', () => {
-  Promise.allSettled([...boards.values()].map(board => connectOrRecover(board.port))).then(results=>{
+  const targets=[...boards.values()];
+  targets.forEach(board=>{board.connectFailures=0;board.nextConnectAttemptAt=0;board.connectionError='';});
+  Promise.allSettled(targets.map(board => connectOrRecover(board.port))).then(results=>{
     const errors=results.filter(r=>r.status==='rejected').map(r=>r.reason.message);
     if(errors.length)toast(errors.join('；'),true);
   });
+});
+$('#phoneRelease').addEventListener('click',async()=>{
+  if(wifiTransport)return;
+  const button=$('#phoneRelease');button.disabled=true;
+  try{
+    await quickStop();
+    forceSession.active=false;forceSession.token++;
+    const targets=[...boards.values()].filter(b=>b.active);
+    for(const b of targets){clearMotionTimers(b);b.motionGeneration++;b.activeMotion=null;}
+    if(!targets.length)throw Error('没有已连接设备可交接');
+    for(const b of targets.filter(b=>b.remote))await send(b.port,'sleep');
+    const results=await Promise.allSettled(targets.filter(b=>!b.remote).map(b=>api('phone-control',{port:b.port,release:true})));
+    const failed=results.filter(r=>r.status==='rejected');
+    toast(failed.length?'部分交接失败：'+failed.map(r=>r.reason.message).join('；'):'已停止并交给手机；USB线可保留，接回时点击“连接 / 接回电脑”',!!failed.length);
+  }catch(e){toast(e.message,true);}finally{button.disabled=false;await refreshPorts();}
 });
 
 $('#stopAll').addEventListener('click', () => {
@@ -2240,30 +2512,42 @@ async function sendBusPing(board, peer) {
 async function forcePair() {
   const pair = [...boards.values()].filter(board => board.active);
   if (pair.length !== 2) throw new Error('需要恰好两块在线板');
-  if (pair.some(board => Date.now() - board.lastTelemetryAt > 500 || !board.sessionId)) throw new Error('两板遥测必须新鲜，请等待通信恢复');
+  const remotes=pair.filter(board=>board.remote),locals=pair.filter(board=>!board.remote);
+  const singleUsb=remotes.length===1&&locals.length===1;
+  if(remotes.length&&(!singleUsb||remotes[0].entry!==locals[0].port))
+    throw new Error('单 USB 力反馈需要同一 DATA 链路上的本机板和一块远端板');
+  if (pair.some(board => Date.now() - board.lastTelemetryAt > (board.remote?1200:500) || !board.sessionId)) throw new Error('两板遥测必须新鲜，请等待通信恢复');
   if (pair.some(board => !Number.isFinite(board.latest.bus) || board.latest.bus < 8 || board.latest.bus > 50)) {
     throw new Error('两块板母线必须在 8–50 V，未执行力反馈');
   }
   if (pair.some(board => board.latest.fault !== 1)) {
     throw new Error('检测到 nFAULT 异常，未执行力反馈');
   }
-  await Promise.all(pair.map(board => send(board.port, 'businfo')));
+  await Promise.all(locals.map(board => send(board.port, 'businfo')));
   await waitUntil(() => pair.every(board => Number.isInteger(board.busAddress)),
     1200, '未读到两块板的 DATA 地址');
   if (pair[0].busAddress === pair[1].busAddress) {
     throw new Error('两块板 DATA 地址重复');
   }
-  // Verify the physical DATA path in both directions before enabling torque.
-  await sendBusPing(pair[0], pair[1]);
-  await sendBusPing(pair[1], pair[0]);
+  // With two USBs, verify each board can initiate a ping. With one USB, the
+  // gateway sends one addressed ping and must receive the remote response.
+  if(singleUsb){
+    const remote=remotes[0];
+    if(remote.gatewayProtocol!==3||!Number.isFinite(remote.modelKe)||remote.modelKe<=0)
+      throw new Error('DATA 对端固件不支持单 USB 力反馈，请先升级到 0.5.10');
+    await sendBusPing(locals[0],remote);
+  }else{
+    await sendBusPing(pair[0], pair[1]);
+    await sendBusPing(pair[1], pair[0]);
+  }
   return pair;
 }
 
-async function cleanupForcePair(pair) {
+async function cleanupForcePair(pair, owner=null) {
   const stopped = await Promise.all(pair.map(async board => {
-    const stop = await send(board.port, 'stop').then(() => true, () => false);
-    const disarm = await send(board.port, 'sync stop').then(() => true, () => false);
-    await send(board.port, 'stream 100').catch(() => {});
+    const stop = await send(board.port, 'stop', owner).then(() => true, () => false);
+    const disarm = await send(board.port, 'sync stop', owner).then(() => true, () => false);
+    if(!board.remote) await send(board.port, 'stream 100', owner).catch(() => {});
     return {board, confirmed: stop && disarm};
   }));
   forceSession.active = false;
@@ -2285,17 +2569,24 @@ async function startForceFeedback() {
       pair = await forcePair();
       check();
       for (const board of pair) {
+        if(board.remote)continue;
         const reply = (await send(board.port, 'model')).reply;
-        if (!/fw=0\.5\.(8-coast-autotune|9-sync-trace)/.test(reply)) throw new Error(board.port + ' 需要升级滑行停止修正固件；未启动');
+        const ke=Number(reply.match(/\bKe=([0-9.eE+-]+)V\//)?.[1]);
+        if(Number.isFinite(ke)&&ke>0)board.modelKe=ke;
+        const fw=/\bfw=([^\s]+)/.exec(reply)?.[1]||'';
+        const compatible=/^0\.5\.(?:8-coast-autotune|9-sync-trace|10-single-usb-force)$/.test(fw);
+        const singleUsbNeedsGateway=pair.some(item=>item.remote);
+        if(!compatible||(singleUsbNeedsGateway&&fw!=='0.5.10-single-usb-force'))
+          throw new Error(board.port + (singleUsbNeedsGateway?' 需要 0.5.10 单 USB 力反馈网关固件':' 需要升级力反馈固件')+'；未启动');
       }
       pair.forEach(board => { clearMotionTimers(board); board.activeMotion = null; board.motionGeneration += 1; });
       // Reduce USB telemetry while force mode is active. DATA synchronization
       // remains at 200 Hz. Reduced USB load is not a timing guarantee.
       await Promise.all(pair.map(async board => {
         await send(board.port, 'stop');
-        await send(board.port, 'stream 50');
+        if(!board.remote)await send(board.port, 'stream 50');
         check();
-        await ensureReady(board);
+        await ensureReady(board,!board.remote);
       }));
       check();
       const stiffness = Number($('#forceK').value);
@@ -2309,11 +2600,9 @@ async function startForceFeedback() {
       const ordered = [...pair].sort((a, b) => b.busAddress - a.busAddress);
       const weakestKt = Math.min(...pair.map(board => board.modelKe));
       if (!Number.isFinite(weakestKt) || weakestKt <= 0) throw new Error('缺少电机扭矩模型');
-      if (Math.abs(pair[0].latest.multi-pair[1].latest.multi)*gearOf(pair[0])>360) {
-        forceState('初始坐标差较大，正在停止并建立本次相对零位…');
-        await rebaseForcePair(pair);
-        check();
-      }
+      // Keep each encoder's absolute multi-turn reference. The signed
+      // software offset handles legitimate differences without an implicit
+      // encoder reset during force startup.
       const origins = new Map(pair.map(board => [board.port, board.latest.multi]));
       for (const board of ordered) {
         check();
@@ -2321,7 +2610,7 @@ async function startForceFeedback() {
         if (gearOf(board) !== gearOf(peer)) throw new Error('两块板减速比不一致');
         const offset = (origins.get(board.port) - origins.get(peer.port)) * gearOf(board);
         const torqueScale = weakestKt / board.modelKe;
-        if (!Number.isFinite(offset) || Math.abs(offset) > 360) throw new Error('两轴初始角度差超出支持范围，请停机后清零');
+        if (!Number.isFinite(offset) || Math.abs(offset) > 36000) throw new Error('两轴相对坐标超出固件支持范围；未改变编码器零位');
         await send(board.port, 'sync force ' + peer.busAddress + ' ' +
           serialNumber(stiffness * torqueScale / gearOf(board)) + ' ' +
           serialNumber(damping * torqueScale / gearOf(board)) + ' 0 ' + serialNumber(limit * torqueScale) + ' 4095 30000 ' + serialNumber(offset));
@@ -2347,20 +2636,20 @@ async function startForceFeedback() {
   });
 }
 
-async function stopForceFeedback() {
+async function stopForceFeedback(owner=null) {
   ++forceSession.token;
   clearTimeout(forceSession.timer);
   forceSession.active = false;
     const pair = forceSession.boards.length
       ? forceSession.boards
       : [...boards.values()].filter(board => board.active);
-    await cleanupForcePair(pair);
+    await cleanupForcePair(pair, owner);
     forceState('力反馈已停止 · 双板停止指令已确认');
 }
 
 async function rebaseForcePair(pair) {
   if(autoTune.active) throw new Error('请先停止自动整定');
-  if(pair.length!==2) throw new Error('需要两台在线设备');
+  if(pair.length!==2||pair.some(board=>board.remote)) throw new Error('编码器清零需要两根 USB 直连；单 USB 力反馈会使用软件偏置，不重置编码器');
   await cleanupForcePair(pair);
   for(const b of pair) {
     if(Date.now()-b.lastTelemetryAt>500 || b.latest.fault!==1) throw new Error(b.port+' 遥测异常，未清零');
@@ -2636,7 +2925,7 @@ async function runAutoTune(identificationOnly = false) {
           report.scope='双向 5/15/30°/s 低速响应采集；非全速/电感/最大连续电流辨识';
           continue;
         }
-        if(!report.model.includes('fw=0.5.9-sync-trace')) throw new Error('请先烧录 0.5.9 同步采样固件；旧数据仍可离线分析，未执行辨识动作');
+        if(!report.model.includes('fw=0.5.10-single-usb-force')) throw new Error('请先烧录 0.5.10 单 USB 力反馈固件；旧数据仍可离线分析，未执行辨识动作');
         report.gear=gear; report.pulses=[];
         for(const ma of [200,-200,225,-225,250,-250,200,-200,225,-225,200,-200]) {
           $('#autoState').textContent=`${b.port} · 电气/机械辨识 ${ma} mA 短脉冲`;
@@ -2769,7 +3058,47 @@ async function runAutoTune(identificationOnly = false) {
   }
 }
 $('#autoTune').addEventListener('click',()=>runAutoTune().catch(e=>{$('#autoState').textContent=e.message;}));
-$('#identifyCapture').addEventListener('click',()=>runAutoTune(true).catch(e=>{$('#autoState').textContent=e.message;}));
+async function runBasicCalibration() {
+  if(autoTune.active)throw new Error('校准正在进行');
+  const targets=[...boards.values()].filter(b=>b.active);
+  if(!targets.length)throw new Error('请先连接设备');
+  autoTune.active=true;autoTune.cancelled=false;
+  $('#identifyCapture').disabled=true;$('#autoProgress').value=0;
+  const rows=[];
+  try {
+    targets.forEach(b=>{clearMotionTimers(b);b.motionGeneration++;b.activeMotion=null;});
+    await quickStop(false,autoTune);await stopForceFeedback(autoTune);
+    for(const [i,b] of targets.entries()) {
+      if(autoTune.cancelled)throw new Error('校准已取消');
+      $('#autoState').textContent=b.port+' · 静止零点校准';
+      await send(b.port,'stop',autoTune);await send(b.port,'sleep',autoTune);
+      if(autoTune.cancelled)throw new Error('校准已取消');
+      await send(b.port,'wake',autoTune); // firmware calibrates current zero with PWM=0
+      await pause(150);
+      if(autoTune.cancelled)throw new Error('校准已取消');
+      const status=(await send(b.port,'status',autoTune)).reply;
+      if(!status.includes('pwm=0/4095')||!status.includes('control=idle'))throw new Error('设备未处于静止校准状态');
+      const encoder=(await send(b.port,'encoder',autoTune)).reply;
+      const profile=(await send(b.port,'motorprofile status',autoTune)).reply;
+      rows.push([b.port,status,encoder,profile].join('\n'));
+      await send(b.port,'sleep',autoTune);
+      $('#autoProgress').value=100*(i+1)/targets.length;
+    }
+    $('#autoState').textContent='基础校准完成；控制增益、方向与减速比未改。长期零点稳定性不由一次校准保证。';
+  } finally {
+    const stopped=await Promise.allSettled(targets.map(async b=>{await send(b.port,'stop',autoTune);await send(b.port,'sleep',autoTune);}));
+    $('#autoReport').textContent=rows.join('\n\n')||'未完成校准';
+    autoTune.active=false;$('#identifyCapture').disabled=false;
+    if(stopped.some(r=>r.status==='rejected'))throw new Error('停止未全部确认，请检查设备连接');
+  }
+}
+$('#identifyCapture').addEventListener('click',()=>{
+  $('#calibrationWindow').showModal();
+  runBasicCalibration().catch(e=>{$('#autoState').textContent=e.message;});
+});
+function closeCalibration(){if(autoTune.active)autoTune.cancelled=true;$('#calibrationWindow').close();}
+$('#calibrationClose').addEventListener('click',closeCalibration);
+$('#calibrationWindow').addEventListener('cancel',()=>{if(autoTune.active)autoTune.cancelled=true;});
 try {
   const report=localStorage.getItem('motor-auto-tune-last-report');
   if(report) {
@@ -2864,15 +3193,56 @@ $('#simpleStrength').addEventListener('change',()=>{
   forceState('手感已选择；停止后再次启动生效');
 });
 setInterval(()=>{
-  const online=[...boards.values()].filter(b=>b.active && Date.now()-b.lastTelemetryAt<500);
-  $('#simpleConnection').textContent=online.length+' / 2 台在线 · '+(autoTune.active?'正在自动整定':forceSession.active?'力反馈运行中':'待机');
+  const online=[...boards.values()].filter(b=>b.active && Date.now()-b.lastTelemetryAt<((wifiTransport||b.remote)?2000:500));
+  const active=[...boards.values()].filter(b=>b.active);
+  if(!wifiTransport){
+    const remote=active.some(b=>b.remote);
+    for(const id of ['forceRebase','identifyCapture','motorSettingsOpen','resetAll','advancedToggle']){
+      const button=$('#'+id);
+      if(remote){button.disabled=true;button.dataset.remoteDisabled='1';button.title='单 USB 已接入主页面手动调试；此高级功能尚未接入远端';}
+      else if(button.dataset.remoteDisabled){delete button.dataset.remoteDisabled;button.disabled=false;button.title='';}
+    }
+    if(remote&&!forceSession.active)$('#forceState').textContent='单 USB：已发现 DATA 对端；等待协议 3 固件、两板就绪和总线应答后可启动双向力反馈。';
+  }
+  const select=$('#quickBoard');
+  for(let i=0;i<2;i++){const option=select.querySelector(`option[value="${i}"]`);option.textContent=active[i]?'仅 '+active[i].port:'第 '+(i+1)+' 台未连接';option.disabled=!active[i];}
+  select.querySelector('option[value="both"]').disabled=online.length<2;
+  $('#simpleConnection').textContent=online.length+' / 2 台在线 · '+(autoTune.active?'正在自动整定':forceSession.active?'力反馈运行中':online.length===1?'请选择仅 '+online[0].port+' 测试；另一台离线':'待机');
+  if([...boards.values()].some(b=>b.phoneControl))$('#simpleConnection').textContent='已交给手机 · 电脑串口不自动重连；点击“连接 / 接回电脑”恢复';
 },500);
+if(wifiTransport){
+  document.body.classList.add('wifi-mode');
+  $('#phoneRelease').hidden=true;$('#connectAll').textContent='重新连接设备';
+  for(const id of ['forceStart','forceRebase','identifyCapture','motorSettingsOpen','resetAll','advancedToggle']){$('#'+id).disabled=true;$('#'+id).title='热点接口尚未接通此功能';}
+  $('#quick-pwm').disabled=true;
+  $('#forceState').textContent='同版界面；热点力反馈接口尚未接通，未启动。';
+  $('#quickState').textContent='拖动更新目标；热点指令1秒有效，不自动续发。PWM/校准/设置尚未接通。';
+}
 await refreshPorts();
 setInterval(refreshPorts, 1000);
-setInterval(() => boards.forEach(pollLogs), 40);
+setInterval(() => boards.forEach(pollLogs), 25);
 // Haptic forces run on the board. This is only a low-rate safety lease.
 setInterval(() => boards.forEach(board => renewMotion(board).catch(error => toast(error.message, true))), 250);
 function stopHiddenKnobs() {
+  // Leaving the page must revoke every actuator lease, not only the legacy
+  // knob lease.  A hidden tab can otherwise keep renewing a position/velocity
+  // target for up to its firmware timeout and resurrect it after a USB
+  // reconnect.  The STOP requests are keepalive writes and never block page
+  // teardown; the next visible interaction must explicitly create a new
+  // generation and target.
+  quickCancelPending();
+  quickEpoch++;
+  quickRun = null;
+  const sendKeepaliveStop=(board,withSync=false)=>{
+    if(board.remote&&usbChain?.owns(board.port)){
+      usbChain.keepaliveControl(board.port,'stop').catch(()=>{});
+      if(withSync)usbChain.keepaliveControl(board.port,'sync_stop').catch(()=>{});
+      return;
+    }
+    const commands=withSync?['stop','sync stop']:['stop'];
+    for(const command of commands)fetch('/api/send',{method:'POST',headers:{'content-type':'application/json'},keepalive:true,
+      body:JSON.stringify({port:board.port,command,wait_ack:false})}).catch(()=>{});
+  };
   if (autoTune.active) {
     autoTune.cancelled=true;
     boards.forEach(b=>{if(b.active) fetch('/api/send',{method:'POST',headers:{'content-type':'application/json'},keepalive:true,body:JSON.stringify({port:b.port,command:'stop'})}).catch(()=>{});});
@@ -2880,18 +3250,14 @@ function stopHiddenKnobs() {
   if (forceSession.active || $('#forceStart').disabled) {
     ++forceSession.token;
     forceSession.active = false;
-    boards.forEach(board => {
-      if (board.active) fetch('/api/send', {method:'POST', headers:{'content-type':'application/json'}, keepalive:true,
-        body:JSON.stringify({port:board.port, command:'stop', wait_ack:false})}).catch(() => {});
-    });
+    boards.forEach(board => {if(board.active)sendKeepaliveStop(board,true);});
   }
   boards.forEach(board => {
-    if (board.activeMotion?.mode !== 'knob') return;
+    if (!board.activeMotion && !board.pendingMotion && !board.motionFlushing) return;
     board.activeMotion = null;
     board.motionGeneration += 1;
     clearMotionTimers(board);
-    fetch('/api/send', {method:'POST', headers:{'content-type':'application/json'}, keepalive:true,
-      body:JSON.stringify({port:board.port, command:'stop', wait_ack:false})}).catch(() => {});
+    sendKeepaliveStop(board,false);
   });
 }
 document.addEventListener('visibilitychange', () => { if (document.hidden) stopHiddenKnobs(); });

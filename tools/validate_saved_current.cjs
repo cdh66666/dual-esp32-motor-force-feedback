@@ -95,7 +95,7 @@ async function main() {
       let original;
       try {
         const model=await send(port,'model');
-        if(!model.includes('fw=0.5.9-sync-trace'))throw Error('Unexpected firmware');
+        if(!model.includes('fw=0.5.10-single-usb-force'))throw Error('Unexpected firmware: expected 0.5.10-single-usb-force');
         const config=await send(port,'cascade status');report.originalConfiguration=config;
         const m=config.match(/current_hz=2000 kp=([\d.]+) ki=([\d.]+) max_pwm=([\d.]+)/);
         if(!m)throw Error('Cannot parse current PI snapshot');

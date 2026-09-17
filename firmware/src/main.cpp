@@ -8,6 +8,12 @@
 #include "usb_tx_policy.h"
 #include "usb_console.h"
 #include "usb_dcd_guard.h"
+#include "wifi_gateway.h"
+#include "gateway_command.h"
+#include "bus_command_cache.h"
+#include "link_indicator.h"
+static gateway::LinkIndicator linkIndicator;
+static int8_t ledOverride = -1;
 #include "driver/adc.h"
 #include "driver/ledc.h"
 #include "esp_adc_cal.h"
@@ -23,7 +29,7 @@
 #endif
 
 static constexpr const char *FW_NAME = "dual-esp32-motor-control";
-static constexpr const char *FW_VERSION = "0.5.9-sync-trace";
+static constexpr const char *FW_VERSION = "0.5.10-single-usb-force";
 static bool loopWatchdogReady = false;
 static uint32_t encoderReadCount = 0, encoderNacks = 0, encoderShortReads = 0;
 static uint32_t encoderRejectedJumps = 0, encoderReadMaxUs = 0;
@@ -310,6 +316,18 @@ static constexpr uint32_t CURRENT_LOOP_PERIOD_US = 500;   // 2 kHz
 static constexpr uint32_t VELOCITY_LOOP_PERIOD_US = 2000; // 500 Hz
 static constexpr uint32_t POSITION_VELOCITY_LOOP_PERIOD_US = 2000; // 500 Hz position velocity
 static constexpr uint32_t POSITION_LOOP_PERIOD_US = 5000;// 200 Hz position
+// MT6701 count quantisation is most visible below a few output rps.  Use a
+// modestly longer physical differentiation window there, while retaining the
+// raw increment at high speed so the 15 r/s command ceiling does not acquire a
+// large phase lag.  This is controller feedback, not a chart-only filter.
+static constexpr uint32_t ENCODER_VELOCITY_WINDOW_US = 5000;
+static constexpr float ENCODER_LOW_SPEED_BLEND_DPS = 1800.0f;
+static constexpr float ENCODER_MEDIAN_BLEND = 0.65f;
+// Do not make the 2 kHz PI reverse PWM for a few mA of ADC noise at a true
+// zero-current request.  The threshold is below the useful haptic/position
+// torque range; any real current or motion remains under closed-loop control.
+static constexpr float CURRENT_ZERO_TARGET_A = 0.015f;
+static constexpr float CURRENT_ZERO_MEASURED_A = 0.035f;
 static float cascadeCurrentKp = 400.0f;      // PWM counts / A
 static float cascadeCurrentKi = 1800.0f;     // PWM counts / (A*s)
 static float cascadeVelocityKp = 0.0005f;    // A / (deg/s)
@@ -335,6 +353,7 @@ static float cascadeSignedPwm = 0.0f;
 static float cascadePositionIntegral = 0.0f;
 static float cascadeVelocityIntegral = 0.0f;
 static float cascadeCurrentIntegral = 0.0f;
+static float cascadeEmfVelocityDps = 0.0f;
 static float cascadeVelocityBreakawayA = 0.0f;
 static bool cascadeVelocityStictionActive = false;
 // The validated current PI can follow a much faster reference than the old
@@ -406,6 +425,10 @@ struct CurrentTraceSample {
   float rotorPositionDeg, rotorVelocityDps;
   uint32_t encoderAgeUs;
   float busV;
+  // Append-only diagnostics. rawMeasuredA is the four-conversion ADC mean,
+  // before digital low-pass; it is not a PWM-carrier-resolved measurement.
+  float rawMeasuredA, dtUs, emfVoltage, requestedPwm, appliedPwm;
+  uint32_t flags; // 1=coast, 2=legacy interlock, 4=voltage rail, 8=dt capped
 };
 static CurrentTraceSample currentTrace[1024];
 static uint16_t currentTraceCount = 0, currentTraceLimit = 0, currentTraceDumpIndex = 0;
@@ -463,6 +486,9 @@ static float syncCurrentLimitMa = 500.0f;
 static uint32_t syncNextTxUs = 0;
 static uint32_t syncLastTxUs = 0;
 static uint32_t syncLastRxUs = 0;
+static uint32_t syncForceVelocityLastUs = 0;
+static float syncForceVelocityErrorFilteredDps = 0.0f;
+static bool syncForceVelocityFilterInitialized = false;
 static uint8_t syncSequence = 0;
 static uint32_t syncTxCount = 0;
 static uint32_t syncRxCount = 0;
@@ -800,17 +826,24 @@ static bool readEncoder(uint16_t &raw, float &degrees) {
     // once below avoids adding a second observer to the measured position.
     const float filteredDeltaDegrees = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
         ? rawDeltaDegrees : medianDeltaDegrees + angleAlpha * absoluteError;
-    // Four milliseconds of accepted displacement suppresses low-speed
+    // Five milliseconds of accepted displacement suppresses low-speed
     // count-to-count differentiation noise without filtering position or
-    // changing the 5.2 output-shaft conversion. Raw velocity remains in S.
+    // changing the 5.2 output-shaft conversion.  Blend the median increment
+    // only below 1800 motor deg/s, where a one-count spike is audible/visible;
+    // at higher speed the raw increment preserves response for the 15 r/s
+    // command ceiling.  Raw velocity remains available in telemetry.
+    const float velocityDeltaDegrees = motor_control::encoderVelocityDelta(
+        rawDeltaDegrees, medianDeltaDegrees, rawMeasuredVelocity,
+        ENCODER_LOW_SPEED_BLEND_DPS, ENCODER_MEDIAN_BLEND);
     const float measuredVelocity = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
-        ? encoderVelocityWindow.update(rawDeltaDegrees, dtUs)
+        ? encoderVelocityWindow.update(velocityDeltaDegrees, dtUs,
+                                       ENCODER_VELOCITY_WINDOW_US)
         : filteredDeltaDegrees * 1000000.0f / static_cast<float>(dtUs);
-    // Keep a physical time constant when the scheduler rate changes. A fixed
-    // 0.08 coefficient at the former ~350 Hz rate delayed speed by ~33 ms.
-    // The new geared-motor loop uses 2 ms; legacy profiles keep their filter.
+    // Keep a physical 2.5 ms time constant when the scheduler rate changes.
+    // The old 2 ms value was fast but let one-count noise reach the outer
+    // position D term.  The extra 0.5 ms is below the 200 Hz position period.
     const float velocityAlpha = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
-        ? static_cast<float>(dtUs) / (2000.0f + static_cast<float>(dtUs)) : 0.08f;
+        ? static_cast<float>(dtUs) / (2500.0f + static_cast<float>(dtUs)) : 0.08f;
     encoderVelocityDegreesPerSecond +=
         velocityAlpha * (measuredVelocity - encoderVelocityDegreesPerSecond);
     encoderFilteredMultiTurnDegrees += filteredDeltaDegrees;
@@ -1254,10 +1287,17 @@ static void applyMotorProfileDefaults() {
     cascadePositionKp = 12.0f;
     cascadePositionKi = 0.0f;
     cascadePositionKd = 0.15f;
+    // Keep the requested 15 r/s output-side test ceiling.  The acceleration
+    // envelope, measured-current limit and voltage rail still determine what
+    // the motor can actually reach on the user's 20 V / 65 W supply.
     cascadePositionMaxVelocityDps = 15.0f * 360.0f * motorProfileGearRatio;
     cascadePositionMinVelocityDps = 0.0f;
     cascadePositionMaxAccelerationDps2 = 40000.0f;
-    cascadePositionDeadbandDeg = 0.10f;
+    cascadePositionMaxJerkDps3 = 300000.0f;
+    cascadeTrajectoryBandwidthRadS = 8.0f;
+    // 1.3 motor degrees is about 0.25 output degrees at 5.2:1.  It is large
+    // enough to stop one-count encoder chatter while remaining visually tight.
+    cascadePositionDeadbandDeg = 1.30f;
     cascadePositionLowSpeedCurrentA = 0.0f;
     cascadeBreakawayPulseCurrentA = 0.0f;
     cascadeBreakawayPulseMs = 15.0f;
@@ -1370,10 +1410,83 @@ static void saveMotorModel() {
   preferences.end();
 }
 
+// Stored per board and motor profile, never by a changeable COM port name.
+// Outer-loop gains, friction/deadband, and direction-specific damping are
+// persisted per board/profile. Current/haptic limits and motion targets are
+// deliberately excluded.
+struct OuterLoopTuning {
+  uint32_t version;
+  float velocityKp, velocityKi, positionKp, positionKi, positionKd;
+};
+static bool outerLoopTuningValid(const OuterLoopTuning &t) {
+  return t.version == 1 &&
+      isfinite(t.velocityKp) && t.velocityKp >= 0 && t.velocityKp <= 1 &&
+      isfinite(t.velocityKi) && t.velocityKi >= 0 && t.velocityKi <= 1 &&
+      isfinite(t.positionKp) && t.positionKp >= 0 && t.positionKp <= 1000 &&
+      isfinite(t.positionKi) && t.positionKi >= 0 && t.positionKi <= 1000 &&
+      isfinite(t.positionKd) && t.positionKd >= 0 && t.positionKd <= 100;
+}
+struct OuterLoopTuningV2 {
+  OuterLoopTuning gains;
+  float frictionA, deadbandDeg;
+};
+static bool outerLoopTuningV2Valid(const OuterLoopTuningV2 &t) {
+  return outerLoopTuningValid(t.gains) &&
+      isfinite(t.frictionA) && t.frictionA >= 0 && t.frictionA <= 5 &&
+      isfinite(t.deadbandDeg) && t.deadbandDeg >= 0 && t.deadbandDeg <= 360;
+}
+struct OuterLoopTuningV3 {
+  OuterLoopTuning gains;
+  float frictionA, deadbandDeg, reverseKdScale;
+};
+static bool outerLoopTuningV3Valid(const OuterLoopTuningV3 &t) {
+  return outerLoopTuningValid(t.gains) &&
+      isfinite(t.frictionA) && t.frictionA >= 0 && t.frictionA <= 5 &&
+      isfinite(t.deadbandDeg) && t.deadbandDeg >= 0 && t.deadbandDeg <= 360 &&
+      isfinite(t.reverseKdScale) && t.reverseKdScale >= 0.1f &&
+      t.reverseKdScale <= 5.0f;
+}
+
 static void loadMotorModel() {
   loadRotorCompensation();
   Preferences preferences;
   if (!preferences.begin(motorModelNamespace(), true)) return;
+  OuterLoopTuning outer{};
+  if (preferences.getBytesLength("outer_v1") == sizeof(outer) &&
+      preferences.getBytes("outer_v1", &outer, sizeof(outer)) == sizeof(outer) &&
+      outerLoopTuningValid(outer)) {
+    cascadeVelocityKp = outer.velocityKp;
+    cascadeVelocityKi = outer.velocityKi;
+    cascadePositionKp = outer.positionKp;
+    cascadePositionKi = outer.positionKi;
+    cascadePositionKd = outer.positionKd;
+  }
+  // Atomically persisted with the gains; old v1 boards still load above.
+  OuterLoopTuningV2 outerV2{};
+  if (preferences.getBytesLength("outer_v2") == sizeof(outerV2) &&
+      preferences.getBytes("outer_v2", &outerV2, sizeof(outerV2)) == sizeof(outerV2) &&
+      outerLoopTuningV2Valid(outerV2)) {
+    cascadeVelocityKp = outerV2.gains.velocityKp;
+    cascadeVelocityKi = outerV2.gains.velocityKi;
+    cascadePositionKp = outerV2.gains.positionKp;
+    cascadePositionKi = outerV2.gains.positionKi;
+    cascadePositionKd = outerV2.gains.positionKd;
+    cascadeVelocityFrictionA = outerV2.frictionA;
+    cascadePositionDeadbandDeg = outerV2.deadbandDeg;
+  }
+  OuterLoopTuningV3 outerV3{};
+  if (preferences.getBytesLength("outer_v3") == sizeof(outerV3) &&
+      preferences.getBytes("outer_v3", &outerV3, sizeof(outerV3)) == sizeof(outerV3) &&
+      outerLoopTuningV3Valid(outerV3)) {
+    cascadeVelocityKp = outerV3.gains.velocityKp;
+    cascadeVelocityKi = outerV3.gains.velocityKi;
+    cascadePositionKp = outerV3.gains.positionKp;
+    cascadePositionKi = outerV3.gains.positionKi;
+    cascadePositionKd = outerV3.gains.positionKd;
+    cascadeVelocityFrictionA = outerV3.frictionA;
+    cascadePositionDeadbandDeg = outerV3.deadbandDeg;
+    cascadePositionReverseKdScale = outerV3.reverseKdScale;
+  }
   if (preferences.getBool("elec_fit", false)) {
     const float storedResistance = preferences.getFloat("r_ohm", modelResistanceOhm);
     const float storedKe = preferences.getFloat("ke_vsr", modelKeVoltSecondsPerRad);
@@ -1826,6 +1939,7 @@ static void modelControlTick() {
 }
 
 static void resetCascadeController() {
+  cascadeEmfVelocityDps = encoderVelocityDegreesPerSecond;
   cascadeNextCurrentUs = cascadeNextVelocityUs = cascadeNextPositionUs = 0;
   cascadeVelocityRequestedDps = 0.0f;
   cascadeVelocityCommandDps = 0.0f;
@@ -1855,40 +1969,25 @@ static void resetCascadeController() {
 }
 
 static void updateCascadePositionTrajectory(float dt) {
-  const float maxVelocity = max(1.0f, cascadePositionMaxVelocityDps);
-  const float maxAcceleration = max(1.0f, cascadePositionMaxAccelerationDps2);
-  const float maxJerk = max(10.0f, cascadePositionMaxJerkDps3);
-  const float bandwidth = constrain(cascadeTrajectoryBandwidthRadS,
-                                    0.2f, 20.0f);
-  const float distance = modelTargetPositionDegrees -
-                         cascadeTrajectoryPositionDeg;
+  const motor_control::PositionTrajectoryState state{
+      cascadeTrajectoryPositionDeg, cascadeTrajectoryVelocityDps,
+      cascadeTrajectoryAccelerationDps2};
+  const auto next = motor_control::positionTrajectoryStep(
+      state, modelTargetPositionDegrees, cascadePositionMaxVelocityDps,
+      cascadePositionMaxAccelerationDps2, cascadePositionMaxJerkDps3,
+      cascadeTrajectoryBandwidthRadS, dt);
+  cascadeTrajectoryPositionDeg = next.positionDeg;
+  cascadeTrajectoryVelocityDps = next.velocityDps;
+  cascadeTrajectoryAccelerationDps2 = next.accelerationDps2;
+}
 
-  if (fabsf(distance) <= 0.001f &&
-      fabsf(cascadeTrajectoryVelocityDps) <= 0.05f) {
-    cascadeTrajectoryPositionDeg = modelTargetPositionDegrees;
-    cascadeTrajectoryVelocityDps = 0.0f;
-    cascadeTrajectoryAccelerationDps2 = 0.0f;
-    return;
-  }
-
-  // Critically damped reference governor. It approaches the target without
-  // reference overshoot, accepts live retargets without resetting velocity,
-  // and is bounded by velocity, acceleration, and jerk limits.
-  const float desiredAcceleration = constrain(
-      bandwidth * bandwidth * distance -
-          2.0f * bandwidth * cascadeTrajectoryVelocityDps,
-      -maxAcceleration, maxAcceleration);
-  const float jerkStep = maxJerk * dt;
-  cascadeTrajectoryAccelerationDps2 += constrain(
-      desiredAcceleration - cascadeTrajectoryAccelerationDps2,
-      -jerkStep, jerkStep);
-  cascadeTrajectoryAccelerationDps2 = constrain(
-      cascadeTrajectoryAccelerationDps2, -maxAcceleration, maxAcceleration);
-
-  cascadeTrajectoryVelocityDps += cascadeTrajectoryAccelerationDps2 * dt;
-  cascadeTrajectoryVelocityDps = constrain(cascadeTrajectoryVelocityDps,
-      -maxVelocity, maxVelocity);
-  cascadeTrajectoryPositionDeg += cascadeTrajectoryVelocityDps * dt;
+static float cascadePositionQuietBandDeg() {
+  // Sub-0.5-degree output holding on this geared motor mostly amplifies
+  // encoder quantization and gearbox lash into visible near-target chatter.
+  return activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
+      ? motor_control::gearedPositionDeadband(cascadePositionDeadbandDeg,
+                                               motorProfileGearRatio, 0.5f)
+      : cascadePositionDeadbandDeg;
 }
 
 static void cascadeControlTick() {
@@ -2015,9 +2114,10 @@ static void cascadeControlTick() {
       if (controlMode == CONTROL_POSITION) {
         const float finalError = modelTargetPositionDegrees -
                                  encoderMultiTurnDegrees;
-        const float releaseWindow = max(0.35f, min(
+        const float quietBand = cascadePositionQuietBandDeg();
+        const float releaseWindow = max(quietBand, max(0.35f, min(
             CASCADE_POSITION_RELEASE_WINDOW_DEG,
-            max(0.35f, cascadePositionDeadbandDeg)));
+            max(0.35f, cascadePositionDeadbandDeg))));
         if (!cascadePositionHoldEnabled && !cascadeBreakawayPulseActive &&
             fabsf(finalError) <= releaseWindow &&
             fabsf(encoderVelocityDegreesPerSecond) <=
@@ -2041,17 +2141,20 @@ static void cascadeControlTick() {
                         encoderVelocityDegreesPerSecond);
           return;
         }
-        if (cascadePositionSettled &&
-            (fabsf(finalError) > cascadePositionDeadbandDeg + 0.25f ||
-             fabsf(encoderVelocityDegreesPerSecond) > 5.0f)) {
+        const bool gearedPositionProfile =
+            activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM;
+        if (gearedPositionProfile) {
+          // Run the jerk-limited goal generator on the board, not in the
+          // browser/DATA link. A single-USB gateway therefore changes only
+          // target latency; it cannot create a different control cadence.
+          updateCascadePositionTrajectory(positionDt);
+        }
+        cascadePositionSettled = motor_control::positionSettledHysteresis(
+            cascadePositionSettled, finalError,
+            encoderVelocityDegreesPerSecond, quietBand,
+            0.1f * motorProfileGearRatio, 8.0f, 20.0f);
+        if (cascadePositionSettled && fabsf(cascadeTrajectoryVelocityDps) >= 0.1f)
           cascadePositionSettled = false;
-        }
-        if (!cascadePositionSettled &&
-            fabsf(finalError) <= cascadePositionDeadbandDeg &&
-            fabsf(encoderVelocityDegreesPerSecond) < 2.0f &&
-            fabsf(cascadeTrajectoryVelocityDps) < 0.1f) {
-          cascadePositionSettled = true;
-        }
         // Integrate only near the final target. The trajectory reference owns
         // large moves; carrying a large approach integral into the hold phase
         // was one cause of the previous overshoot and target-to-target state
@@ -2064,17 +2167,26 @@ static void cascadeControlTick() {
         } else {
           cascadePositionIntegral *= max(0.0f, 1.0f - 4.0f * positionDt);
         }
-        // Real position PID outer loop. The position parameters must affect
-        // the next-loop velocity reference; previously this block ignored
-        // Kp/Ki/Kd and always used a hard-coded full-speed profile, making the
-        // sliders appear broken. Kd is the measured-velocity term because
-        // d(position_error)/dt = -measured_velocity.
-        const float positionP = cascadePositionKp * finalError;
         const float positionI = cascadePositionKi * cascadePositionIntegral;
-        const float positionD = -cascadePositionKd *
-                                encoderVelocityDegreesPerSecond;
-        float positionVelocityRequest = positionP + positionI + positionD;
-        if (fabsf(finalError) <= cascadePositionDeadbandDeg) {
+        float positionVelocityRequest = 0.0f;
+        if (gearedPositionProfile) {
+          // Track the local motion profile with velocity feed-forward and
+          // bounded outer position correction. The inner velocity PI remains
+          // responsible for damping measured-speed error; this avoids making
+          // every raw target step an instantaneous high-gain velocity jump.
+          positionVelocityRequest =
+              motor_control::positionVelocityTrackingCommand(
+                  cascadeTrajectoryPositionDeg, encoderMultiTurnDegrees,
+                  cascadeTrajectoryVelocityDps,
+                  encoderVelocityDegreesPerSecond, cascadePositionKp,
+                  cascadePositionKd, cascadePositionReverseKdScale) + positionI;
+        } else {
+          const float positionP = cascadePositionKp * finalError;
+          const float positionD = -cascadePositionKd *
+                                  encoderVelocityDegreesPerSecond;
+          positionVelocityRequest = positionP + positionI + positionD;
+        }
+        if (cascadePositionSettled || fabsf(finalError) <= quietBand) {
           positionVelocityRequest = 0.0f;
         } else if (fabsf(positionVelocityRequest) <
                    cascadePositionMinVelocityDps) {
@@ -2087,7 +2199,7 @@ static void cascadeControlTick() {
         // Keep the PID response within the identified acceleration envelope.
         // This is a constraint on the reference, not a replacement for PID.
         const float brakingDistance = max(0.0f,
-            fabsf(finalError) - cascadePositionDeadbandDeg);
+            fabsf(finalError) - quietBand);
         const float brakingSpeed = sqrtf(2.0f *
             max(1.0f, cascadePositionMaxAccelerationDps2) * brakingDistance);
         const float referenceSpeedLimit = min(
@@ -2101,11 +2213,6 @@ static void cascadeControlTick() {
         cascadeVelocityRequestedDps = constrain(
             positionVelocityRequest,
             -cascadePositionMaxVelocityDps, cascadePositionMaxVelocityDps);
-        // Keep the trajectory state available for diagnostics/retargeting,
-        // but do not use its lagging position as feedback for the actuator.
-        cascadeTrajectoryPositionDeg = encoderMultiTurnDegrees;
-        cascadeTrajectoryVelocityDps = cascadeVelocityRequestedDps;
-        cascadeTrajectoryAccelerationDps2 = 0.0f;
       } else if (controlMode == CONTROL_VELOCITY) {
         cascadeVelocityRequestedDps = modelTargetVelocityDps;
       }
@@ -2114,14 +2221,17 @@ static void cascadeControlTick() {
   if (velocityDue) {
     if (controlMode == CONTROL_POSITION || controlMode == CONTROL_VELOCITY) {
       if (controlMode == CONTROL_POSITION) {
-        // The position outer loop is a final-error PD law.  Slew its velocity
-        // output with the identified acceleration envelope so a retarget or a
-        // sign change cannot become an instantaneous torque reversal.
+        // Ramp acceleration, but do not delay the geared motor's PD braking
+        // request behind a second symmetric reference ramp. Current slew and
+        // current limits remain active downstream. Legacy profiles unchanged.
         const float velocityStep =
             max(1.0f, cascadePositionMaxAccelerationDps2) * velocityDt;
-        cascadeVelocityCommandDps += constrain(
-            cascadeVelocityRequestedDps - cascadeVelocityCommandDps,
-            -velocityStep, velocityStep);
+        cascadeVelocityCommandDps = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
+            ? motor_control::positionVelocityReference(
+                cascadeVelocityCommandDps, cascadeVelocityRequestedDps,
+                encoderVelocityDegreesPerSecond, velocityStep)
+            : motor_control::slew(cascadeVelocityCommandDps,
+                                 cascadeVelocityRequestedDps, velocityStep);
         if (fabsf(cascadeVelocityRequestedDps) < 0.01f &&
             fabsf(cascadeVelocityCommandDps) < velocityStep) {
           cascadeVelocityCommandDps = 0.0f;
@@ -2450,7 +2560,8 @@ static void cascadeControlTick() {
   }
 
   if (!motor_control::takeDeadline(nowUs, cascadeNextCurrentUs, CURRENT_LOOP_PERIOD_US)) return;
-  const float currentMv = filterCurrentSenseMillivolts(readCurrentSenseMillivolts());
+  const float currentRawMv = readCurrentSenseMillivolts();
+  const float currentMv = filterCurrentSenseMillivolts(currentRawMv);
   const uint32_t currentSampleUs = micros();
   const uint32_t currentElapsedUs = currentSampleUs - cascadeLastCurrentUs;
   const float currentDt = cascadeLastCurrentUs == 0
@@ -2511,13 +2622,17 @@ static void cascadeControlTick() {
                      cascadeBusVoltage, cascadeMeasuredCurrentA);
     }
   }
+  CurrentTraceSample *traceSample = nullptr;
   if (currentTraceCount < currentTraceLimit) {
     const uint32_t traceNowUs = micros();
-    currentTrace[currentTraceCount++] = {
+    traceSample = &currentTrace[currentTraceCount++];
+    *traceSample = {
         static_cast<uint64_t>(esp_timer_get_time()) - static_cast<uint32_t>(traceNowUs-currentSampleUs),
         currentTarget, cascadeMeasuredCurrentA, cascadeSignedPwm,
         encoderMultiTurnDegrees, encoderVelocityDegreesPerSecond,
-        static_cast<uint32_t>(traceNowUs-encoderPreviousSampleUs), cascadeBusVoltage};
+        static_cast<uint32_t>(traceNowUs-encoderPreviousSampleUs), cascadeBusVoltage,
+        readSignedCurrentMilliamps(currentRawMv) / 1000.0f,
+        currentDt * 1000000.0f, 0.0f, 0.0f, 0.0f, 0u};
   }
   // A zero current reference means high impedance/coast for this sign-
   // magnitude bridge. Do not use a reverse voltage pulse to cancel the
@@ -2527,6 +2642,20 @@ static void cascadeControlTick() {
   // reaches the current regulator and is allowed to brake the rotor.
   const bool continuousCurrent = activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM;
   if (interactionCoast || (!continuousCurrent && fabsf(currentTarget) < 0.005f)) {
+    if (traceSample) traceSample->flags = 1u;
+    cascadeCurrentIntegral = 0.0f;
+    cascadeSignedPwm = 0.0f;
+    applyCascadeBridgePwm(0.0f);
+    return;
+  }
+  // At a genuine zero-torque request, a few milliamps of INA240/ADC noise
+  // should not make the sign-magnitude bridge alternate polarity at 2 kHz.
+  // This is intentionally a narrow, measured-current dead zone: a real
+  // haptic demand, braking current, or sensor disturbance above the threshold
+  // still reaches the normal signed PI immediately.
+  if (continuousCurrent && fabsf(currentTarget) < CURRENT_ZERO_TARGET_A &&
+      fabsf(cascadeMeasuredCurrentA) < CURRENT_ZERO_MEASURED_A) {
+    if (traceSample) traceSample->flags = 1u;
     cascadeCurrentIntegral = 0.0f;
     cascadeSignedPwm = 0.0f;
     applyCascadeBridgePwm(0.0f);
@@ -2545,6 +2674,7 @@ static void cascadeControlTick() {
   // The old 775 coast interlock is NOT part of the 36GP current controller.
   if (!continuousCurrent && cascadeMeasuredCurrentA * currentTarget < 0.0f &&
       fabsf(cascadeMeasuredCurrentA) > 0.08f) {
+    if (traceSample) traceSample->flags = 2u;
     cascadeCurrentIntegral = 0.0f;
     cascadeSignedPwm = 0.0f;
     applyCascadeBridgePwm(0.0f);
@@ -2557,7 +2687,10 @@ static void cascadeControlTick() {
       static_cast<float>(CURRENT_LOOP_PERIOD_US) / 1000000.0f);
   const float candidateIntegral = constrain(
       cascadeCurrentIntegral + currentError * integrationDt, -5.0f, 5.0f);
-  const float omega = encoderVelocityDegreesPerSecond * 0.01745329252f;
+  cascadeEmfVelocityDps = motor_control::emfVelocityEstimate(
+      cascadeEmfVelocityDps, encoderVelocityDegreesPerSecond, currentDt);
+  const float omega = (continuousCurrent ? cascadeEmfVelocityDps
+      : encoderVelocityDegreesPerSecond) * 0.01745329252f;
   // Two-degree-of-freedom PI for 36GP: model voltage supplies the setpoint,
   // P acts on measurement (beta=0), and I regulates true target-minus-current.
   // This avoids adding a proportional setpoint kick on top of R*I feedforward
@@ -2572,18 +2705,14 @@ static void cascadeControlTick() {
   const float pwmLimit = min(
       min(static_cast<float>(modelMaxDuty), cascadeCurrentMaxPwm),
       static_cast<float>(motorProfileVoltageDutyLimit(cascadeBusVoltage)));
-  // Model-based voltage envelope supplements measured-current PI. Preserve
-  // signed braking authority and back-EMF compensation, without coast/rearm.
-  // R/Ke uncertainty means this is not a hardware current guarantee.
-  const float emf = modelKeVoltSecondsPerRad * omega;
-  // Preserve the user-accepted direct-current/haptic path. Position/velocity
-  // need measured-current PI authority beyond this unvalidated model envelope.
-  const bool useModelEnvelope = continuousCurrent &&
-      controlMode != CONTROL_POSITION && controlMode != CONTROL_VELOCITY;
-  const float lowerPwm = useModelEnvelope && cascadeMeasuredCurrentA <= operatingLimit ? interaction::currentVoltageBound(
-      emf, modelResistanceOhm, -operatingLimit, cascadeBusVoltage, pwmLimit) : -pwmLimit;
-  const float upperPwm = useModelEnvelope && cascadeMeasuredCurrentA >= -operatingLimit ? interaction::currentVoltageBound(
-      emf, modelResistanceOhm, operatingLimit, cascadeBusVoltage, pwmLimit) : pwmLimit;
+  // R/Ke are an approximate feed-forward model, not an authoritative voltage
+  // constraint. The old +/-R*I envelope around Ke*speed blocked the integrator
+  // from correcting a wrong Ke at speed in current/haptic modes. Give the
+  // measured-current regulator the same hardware voltage rails in all modes.
+  // Operating current reference clamp, measured-current interaction guard,
+  // nFAULT, supply checks and PWM/rated-voltage limits remain independent.
+  const float lowerPwm = -pwmLimit;
+  const float upperPwm = pwmLimit;
   const bool saturated = (candidatePwm > upperPwm && currentError > 0.0f) ||
                          (candidatePwm < lowerPwm && currentError < 0.0f);
   if (!saturated) cascadeCurrentIntegral = candidateIntegral;
@@ -2594,6 +2723,13 @@ static void cascadeControlTick() {
   if (continuousCurrent && cascadeCurrentKi > 0.0f && cascadeSignedPwm != requestedPwm) {
     cascadeCurrentIntegral = constrain((cascadeSignedPwm-feedforwardPwm-
         cascadeCurrentKp*proportionalError)/cascadeCurrentKi, -5.0f, 5.0f);
+  }
+  if (traceSample) {
+    traceSample->emfVoltage = modelKeVoltSecondsPerRad * omega;
+    traceSample->requestedPwm = requestedPwm;
+    traceSample->appliedPwm = cascadeSignedPwm;
+    traceSample->flags = (requestedPwm != cascadeSignedPwm ? 4u : 0u) |
+                        (integrationDt < currentDt ? 8u : 0u);
   }
   applyCascadeBridgePwm(cascadeSignedPwm);
   // A successful USB command is not proof that the power stage is working.
@@ -2903,10 +3039,18 @@ static void streamTick() {
   // S,t_ms,single,multi,bus_v,current_ma,pwm_abs,nFAULT,awake,step,raw,
   // velocity,control,target,phase,pwm_signed,pid_raw,pid_applied,stall_boost,
   // settled,velocity_target,current_target_ma,current_measured_ma,cascade_pwm,
-  // raw_velocity_dps.
+  // raw_velocity_dps,force_active,peer_fresh,peer_pos_motor_deg,
+  // peer_velocity_motor_dps,peer_current_mA,peer_pwm_abs,peer_nFAULT,
+  // peer_armed,peer_command_pos_deg,peer_command_velocity_dps,
+  // peer_command_current_mA. Peer values are already on the 200 Hz DATA
+  // feedback path; exporting them here lets one-USB scope stay at USB rate
+  // without adding competing status transactions to the haptic bus.
   // Do not divide 32-bit micros(): its 71-minute wrap looked like a reboot
   // to the browser and invalidated position-hold leases during long sessions.
-  Console.printf("S,%llu,%.2f,%.2f,%.2f,%.0f,%u,%d,%d,%u,%u,%.1f,%u,%.2f,%d,%d,%.1f,%.1f,%.1f,%d,%.1f,%.0f,%.0f,%.1f,%.1f,%.2f,%u\n",
+  const uint32_t peerAgeUs = syncLastRxUs == 0 ? UINT32_MAX : nowUs - syncLastRxUs;
+  const bool peerFresh = syncMode == SYNC_FORCE && syncMotionArmed &&
+                         peerAgeUs <= SYNC_LINK_TIMEOUT_US;
+  Console.printf("S,%llu,%.2f,%.2f,%.2f,%.0f,%u,%d,%d,%u,%u,%.1f,%u,%.2f,%d,%d,%.1f,%.1f,%.1f,%d,%.1f,%.0f,%.0f,%.1f,%.1f,%.2f,%u,%u,%.2f,%.1f,%.0f,%u,%d,%d,%.2f,%.1f,%.0f\n",
                 static_cast<unsigned long long>(esp_timer_get_time() / 1000), singleTurnDegrees, encoderMultiTurnDegrees,
                 busV, currentMa, static_cast<unsigned>(pwmDuty()), digitalRead(PIN_NFAULT),
                 driverAwake ? 1 : 0, static_cast<unsigned>(currentStep), raw,
@@ -2920,7 +3064,14 @@ static void streamTick() {
                     ? interactionEffectiveCurrentA : cascadeCurrentCommandA) * 1000.0f,
                 currentMa, cascadeSignedPwm,
                 encoderRawVelocityDegreesPerSecond, modelTargetPositionDegrees,
-                syncMotionArmed && syncMode == SYNC_FORCE ? 1u : 0u);
+                syncMotionArmed && syncMode == SYNC_FORCE ? 1u : 0u,
+                peerFresh ? 1u : 0u, syncRemotePositionDeg,
+                syncRemoteVelocityDps, syncRemoteCurrentMa,
+                static_cast<unsigned>(syncRemotePwm),
+                static_cast<int>(syncRemoteFault),
+                static_cast<int>(syncRemoteAwake),
+                syncRemoteCommandPositionDeg, syncRemoteCommandVelocityDps,
+                syncRemoteCommandCurrentMa);
 }
 
 static void setDriverAwake(bool awake) {
@@ -3037,6 +3188,9 @@ static void syncResetLinkCounters() {
   syncNextTxUs = 0;
   syncLastTxUs = 0;
   syncLastRxUs = 0;
+  syncForceVelocityLastUs = 0;
+  syncForceVelocityErrorFilteredDps = 0.0f;
+  syncForceVelocityFilterInitialized = false;
   syncSequence = 0;
   syncTxCount = 0;
   syncRxCount = 0;
@@ -3160,8 +3314,16 @@ static void syncApplyRemoteState() {
   } else if (syncMode == SYNC_FORCE) {
     const float positionError = syncRemotePositionDeg + syncPositionOffsetDeg -
                                  encoderMultiTurnDegrees;
-    const float velocityError = syncRemoteVelocityDps -
-                                encoderVelocityDegreesPerSecond;
+    const float rawVelocityError = syncRemoteVelocityDps -
+                                   encoderVelocityDegreesPerSecond;
+    const uint32_t filterNowUs = micros();
+    const uint32_t filterElapsedUs = syncForceVelocityLastUs == 0
+        ? 0 : filterNowUs - syncForceVelocityLastUs;
+    syncForceVelocityErrorFilteredDps = motor_control::bilateralVelocityError(
+        syncForceVelocityErrorFilteredDps, rawVelocityError, filterElapsedUs,
+        syncForceVelocityFilterInitialized);
+    syncForceVelocityLastUs = filterNowUs;
+    syncForceVelocityFilterInitialized = true;
     // Motor current is the available torque proxy. The spring/damper term
     // couples the two encoder states; reflectionGain optionally mirrors the
     // remote branch current for a bilateral force-feedback experiment.
@@ -3169,7 +3331,7 @@ static void syncApplyRemoteState() {
     // felt by the peer has the opposite sign, hence the subtraction below.
     // A delayed, sampled coupling is NOT guaranteed passive by reflection=0.
     const float commandedMa = syncStiffnessMaPerDeg * positionError +
-                              syncDampingMaPerDps * velocityError -
+                              syncDampingMaPerDps * syncForceVelocityErrorFilteredDps -
                               syncReflectionGain * syncRemoteCurrentMa;
     const float forceCeilingMa = min(syncCurrentLimitMa,
         interaction::operatingCurrentLimit(modelCurrentLimitAmps) * 1000.0f);
@@ -3247,6 +3409,8 @@ static void busSendText(uint8_t destination, uint8_t type, uint8_t sequence,
 
 static void busStartTransaction(uint8_t destination, uint8_t sequence,
                                 const String &command) {
+  // Broadcast STOP cancels a pending command; never retry a pre-STOP target.
+  if (destination == BUS_BROADCAST && command == "stop") busTransactionActive = false;
   const uint8_t length = static_cast<uint8_t>(min<size_t>(BUS_MAX_PAYLOAD, command.length()));
   busSendFrame(destination, BUS_TYPE_COMMAND, sequence,
                reinterpret_cast<const uint8_t *>(command.c_str()), length);
@@ -3282,12 +3446,18 @@ static void busTransactionTick() {
 }
 
 static void busSendStatus(uint8_t destination, uint8_t sequence) {
-  uint16_t raw = 0;
-  float singleDegrees = 0.0f;
-  readEncoder(raw, singleDegrees);
-  const float busV = readBusVoltage();
-  const float currentMv = filterCurrentSenseMillivolts(readCurrentSenseMillivolts());
-  const float currentMa = readSignedCurrentMilliamps(currentMv);
+  // A DATA status request must not insert extra I2C/ADC samples into the
+  // active control filters. Match USB streaming: report the controller's
+  // accepted snapshot, independent of how often another node queries us.
+  uint16_t raw = encoderPreviousRaw;
+  float singleDegrees = encoderLastSingleTurnDegrees;
+  if (!encoderTurnInitialized) readEncoder(raw, singleDegrees);
+  const float busV = modelControlActive ? cascadeBusVoltage : readBusVoltage();
+  float currentMa = cascadeMeasuredCurrentA * 1000.0f;
+  if (!modelControlActive) {
+    const float currentMv = filterCurrentSenseMillivolts(readCurrentSenseMillivolts());
+    currentMa = readSignedCurrentMilliamps(currentMv);
+  }
   latestCurrentMilliamps = currentMa;
   char status[BUS_MAX_PAYLOAD + 1] = {};
   snprintf(status, sizeof(status),
@@ -3303,6 +3473,7 @@ static void busSendStatus(uint8_t destination, uint8_t sequence) {
 static void busHandleCommand(uint8_t source, uint8_t sequence, uint8_t destination,
                              const String &command);
 static void handleCommand(String cmd);
+static void wifiBusReply(uint8_t source,uint8_t sequence,uint8_t type,const String &payload);
 
 static bool busHandleFrame(const uint8_t *frame, uint16_t frameLength) {
   if (frameLength < 10 || frame[0] != BUS_MAGIC_1 || frame[1] != BUS_MAGIC_2 ||
@@ -3319,6 +3490,7 @@ static bool busHandleFrame(const uint8_t *frame, uint16_t frameLength) {
   const uint8_t destination = frame[3];
   if (destination != busAddress && destination != BUS_BROADCAST) return true;
   ++busAddressedFrameCount;
+  linkIndicator.activity(millis());
   const uint8_t source = frame[4];
   const uint8_t sequence = frame[5];
   const uint8_t type = frame[6];
@@ -3339,6 +3511,7 @@ static bool busHandleFrame(const uint8_t *frame, uint16_t frameLength) {
                      static_cast<unsigned>(source), static_cast<unsigned>(type),
                      static_cast<unsigned>(sequence));
     }
+    wifiBusReply(source,sequence,type,payload);
     Console.printf("BUS_RX from=%u type=%u seq=%u payload=%s\n",
                    static_cast<unsigned>(source), static_cast<unsigned>(type),
                    static_cast<unsigned>(sequence), payload.c_str());
@@ -3421,10 +3594,24 @@ static void busProcessRx() {
 
 static void busHandleCommand(uint8_t source, uint8_t sequence, uint8_t destination,
                              const String &command) {
+  static gateway::BusCommandCache commandCache;
   const bool broadcast = destination == BUS_BROADCAST;
+  // Always execute STOP/sleep, and always answer queries from fresh state.
+  const bool cacheable = !broadcast && command != "stop" && command != "sleep" &&
+      command != "disarm" && command != "status" && command != "ping" && command != "gatewayinfo" &&
+      command != "sync status" && command != "sync stop" && command != "sync off";
+  if (cacheable) {
+    if (const char *cached = commandCache.find(source, sequence, command.c_str(), millis())) {
+      busSendText(source, BUS_TYPE_RESPONSE, sequence, String(cached));
+      return;
+    }
+  }
   auto reply = [&](const String &text, bool ok = true) {
-    if (!broadcast) busSendText(source, BUS_TYPE_RESPONSE, sequence,
-                                String(ok ? "ACK," : "NACK,") + String(sequence) + "," + text);
+    if (!broadcast) {
+      const String response = String(ok ? "ACK," : "NACK,") + String(sequence) + "," + text;
+      if (cacheable) commandCache.remember(source, sequence, command.c_str(), response.c_str(), millis());
+      busSendText(source, BUS_TYPE_RESPONSE, sequence, response);
+    }
   };
   if (command == "ping") {
     if (!broadcast) {
@@ -3436,6 +3623,26 @@ static void busHandleCommand(uint8_t source, uint8_t sequence, uint8_t destinati
   }
   if (command == "status") {
     if (!broadcast) busSendStatus(source, sequence);
+    return;
+  }
+  if (command == "gatewayinfo") {
+    char info[96];
+    snprintf(info, sizeof(info), "META,%u,%llX,%.4f,%.3f,%.6f,3", busAddress,
+             static_cast<unsigned long long>(ESP.getEfuseMac()), motorProfileGearRatio,
+             modelCurrentLimitAmps, modelKeVoltSecondsPerRad);
+    if (!broadcast) busSendText(source, BUS_TYPE_RESPONSE, sequence, String(info));
+    return;
+  }
+  if (command == "sync status") {
+    char state[BUS_MAX_PAYLOAD + 1] = {};
+    const uint32_t ageUs = syncLastRxUs == 0 ? 0 : micros() - syncLastRxUs;
+    snprintf(state, sizeof(state), "ACK,%u,SYNC mode=%s peer=%u armed=%d leader=%d period=%luus age=%luus",
+             static_cast<unsigned>(sequence), syncModeName(),
+             static_cast<unsigned>(syncPeerAddress), syncMotionArmed ? 1 : 0,
+             syncPeerAddress != 0 && busAddress < syncPeerAddress ? 1 : 0,
+             static_cast<unsigned long>(SYNC_PERIOD_US),
+             static_cast<unsigned long>(ageUs));
+    if (!broadcast) busSendText(source, BUS_TYPE_RESPONSE, sequence, String(state));
     return;
   }
   if (command == "arm") {
@@ -3467,15 +3674,37 @@ static void busHandleCommand(uint8_t source, uint8_t sequence, uint8_t destinati
     reply("awake=0 pwm=0");
     return;
   }
-  if (command == "identify start") {
+  if (command == "recover") {
+    // Recovery is a stop-only maintenance action.  It clears the latched
+    // power-path guard after rechecking nFAULT, supply voltage, and PWM
+    // hardware, so a single USB gateway can recover a remote board too.
+    Console.beginCommandResult();
     handleCommand(command);
-    reply("executed=identify start");
+    const bool accepted = Console.endCommandResult();
+    reply(accepted ? "recovered power_path_fault=0 pwm=0" : "rejected=recover", accepted);
+    return;
+  }
+  if (command == "sync stop" || command == "sync off" ||
+      command.startsWith("sync force ")) {
+    Console.beginCommandResult();
+    handleCommand(command);
+    const bool accepted = Console.endCommandResult();
+    reply(String(accepted ? "accepted=" : "rejected=") + command, accepted);
+    return;
+  }
+  if (command == "identify start") {
+    Console.beginCommandResult();
+    handleCommand(command);
+    const bool accepted = Console.endCommandResult();
+    reply(accepted ? "accepted=identify start" : "rejected=identify start", accepted);
     return;
   }
   if (command.startsWith("pos ") || command.startsWith("velocity ") ||
-      command.startsWith("current ") || command.startsWith("cw ") || command.startsWith("ccw ")) {
+      command.startsWith("posout ") || command.startsWith("current ") || command.startsWith("cw ") || command.startsWith("ccw ")) {
+    Console.beginCommandResult();
     handleCommand(command);
-    reply(String("executed=") + command);
+    const bool accepted = Console.endCommandResult();
+    reply(String(accepted ? "accepted=" : "rejected=") + command, accepted);
     return;
   }
   reply("unknown command", false);
@@ -3497,6 +3726,10 @@ static void printHelp() {
 
 static void handleCommand(String cmd) {
   cmd.trim();
+  if(cmd=="wifi status") {
+    Console.println(motor_wifi::diagnostics());
+    return;
+  }
   if (!cmd.length()) return;
   const int firstSpace = cmd.indexOf(' ');
   const String op = firstSpace < 0 ? cmd : cmd.substring(0, firstSpace);
@@ -3751,8 +3984,12 @@ static void handleCommand(String cmd) {
                      static_cast<unsigned long>(millis() - usbLastCommandMs));
       Console.printf("ADC_STATS burst_max_us=%lu cached_calibration=%d\n",
                      static_cast<unsigned long>(adcReadMaxUs), adcCalibrationReady ? 1 : 0);
-      Console.printf("CONTROL_FILTERS deadline_skip_missed=1 current_active_tau_us=1522.05 velocity_window_us=%u raw_velocity_in_stream=1\n",
-          activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM ? 4000u : 0u);
+      Console.printf("CONTROL_FILTERS deadline_skip_missed=1 current_active_tau_us=1522.05 velocity_window_us=%u velocity_tau_us=2500 median_blend=%.2f zero_current_target_mA=%.1f zero_current_measure_mA=%.1f raw_velocity_in_stream=1\n",
+          activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
+              ? ENCODER_VELOCITY_WINDOW_US : 0u,
+          activeMotorProfile == MOTOR_PROFILE_36GP555_24V_1538RPM
+              ? ENCODER_MEDIAN_BLEND : 0.0f,
+          CURRENT_ZERO_TARGET_A * 1000.0f, CURRENT_ZERO_MEASURED_A * 1000.0f);
       Console.printf("CURRENT_TIMING sample_min_us=%lu sample_max_us=%lu trace_clock=sample_complete\n",
           static_cast<unsigned long>(cascadeCurrentMinPeriodUs == UINT32_MAX ? 0 : cascadeCurrentMinPeriodUs),
           static_cast<unsigned long>(cascadeCurrentMaxPeriodUs));
@@ -3778,6 +4015,38 @@ static void handleCommand(String cmd) {
                      static_cast<unsigned long>(dcdStats.transferMaxUs));
       Console.printf("COGGING_CFG scale=%.3f coulomb=%.4fA offset=%.4fA calibrated=%d limit=0.3A coordinate=raw_encoder\n",
                      rotorComp.scale, rotorComp.coulombA, rotorComp.offsetA, rotorComp.scale>0 ? 1 : 0);
+    } else if (rest == "save_outer") {
+      if (driverAwake || modelControlActive || positionActive || pwmDuty() != 0) {
+        Console.println("ERR save_outer requires STOP and sleep");
+        return;
+      }
+      const OuterLoopTuning outer{1, cascadeVelocityKp, cascadeVelocityKi,
+          cascadePositionKp, cascadePositionKi, cascadePositionKd};
+      const OuterLoopTuningV2 outerV2{outer, cascadeVelocityFrictionA,
+          cascadePositionDeadbandDeg};
+      const OuterLoopTuningV3 outerV3{outer, cascadeVelocityFrictionA,
+          cascadePositionDeadbandDeg, cascadePositionReverseKdScale};
+      if (!outerLoopTuningV2Valid(outerV2) ||
+          !outerLoopTuningV3Valid(outerV3)) {
+        Console.println("ERR save_outer invalid gains");
+        return;
+      }
+      Preferences p;
+      const bool opened = p.begin(motorModelNamespace(), false);
+      // V3 is the authoritative atomic record; keep V2 current as a downgrade
+      // compatibility shadow for already-deployed firmware.
+      const bool savedV2 = opened &&
+          p.putBytes("outer_v2", &outerV2, sizeof(outerV2)) == sizeof(outerV2);
+      const bool savedV3 = opened &&
+          p.putBytes("outer_v3", &outerV3, sizeof(outerV3)) == sizeof(outerV3);
+      if (opened) p.end();
+      if (savedV2 && savedV3) {
+        Console.printf("OK cascade_save_outer saved=1 reverse_kd_scale=%.2f\n",
+                       cascadePositionReverseKdScale);
+      } else {
+        Console.printf("ERR save_outer NVS write failed; v2=%d v3=%d\n",
+                       savedV2 ? 1 : 0, savedV3 ? 1 : 0);
+      }
     } else if (rest.startsWith("cogging ")) {
       if (modelControlActive || pwmDuty() != 0 || activeMotorProfile != MOTOR_PROFILE_36GP555_24V_1538RPM) {
         Console.println("ERR cogging configuration requires STOP and 36gp555 profile");
@@ -4122,6 +4391,10 @@ static void handleCommand(String cmd) {
       Console.println("ERR empty or oversized bus command");
       return;
     }
+    if (busTransactionActive && destination != BUS_BROADCAST) {
+      Console.println("ERR bus busy; previous transaction pending");
+      return;
+    }
     const uint8_t sequence = ++busSequence;
     busStartTransaction(destination, sequence, busCommand);
     Console.printf("OK bus_tx dest=%s seq=%u command=%s\n", destinationText.c_str(),
@@ -4218,7 +4491,7 @@ static void handleCommand(String cmd) {
           !isfinite(damping) || !isfinite(reflection) || !isfinite(limit) || !isfinite(offset) ||
           stiffness < 0.0f || stiffness > 1000.0f || damping < 0.0f ||
           damping > 1000.0f || reflection < 0.0f || reflection > 4.0f ||
-          limit < 10.0f || limit > 4500.0f || fabsf(offset) > 360.0f ||
+          limit < 10.0f || limit > 4500.0f || fabsf(offset) > 36000.0f ||
           duty < 12 || duty > TEST_DUTY_MAX ||
           timeout < 100 || timeout > 30000) {
         Console.println("ERR usage: sync force PEER KP_MA_PER_DEG KD_MA_PER_DPS REFLECT_GAIN LIMIT_MA MAX_DUTY TIMEOUT_MS [OFFSET_DEG]");
@@ -4435,9 +4708,10 @@ static void handleCommand(String cmd) {
     else if (rest == "fast") { runningDecayFast = true; digitalWrite(PIN_DECAY, HIGH); Console.println("OK decay=fast stop=coast"); }
     else Console.println("ERR usage: decay slow|fast");
   } else if (op == "led") {
-    if (rest == "on") { digitalWrite(PIN_LED, HIGH); Console.println("OK led=on"); }
-    else if (rest == "off") { digitalWrite(PIN_LED, LOW); Console.println("OK led=off"); }
-    else Console.println("ERR usage: led on|off");
+    if (rest == "on") { ledOverride=1; digitalWrite(PIN_LED, HIGH); Console.println("OK led=on"); }
+    else if (rest == "off") { ledOverride=0; digitalWrite(PIN_LED, LOW); Console.println("OK led=off"); }
+    else if (rest == "auto") { ledOverride=-1; Console.println("OK led=auto"); }
+    else Console.println("ERR usage: led on|off|auto");
   } else if (op == "pos" || op == "posout") {
     float target = 0.0f;
     int duty = 0, timeout = 0;
@@ -4548,6 +4822,71 @@ static void handleCommand(String cmd) {
   }
 }
 
+static motor_wifi::Request wifiPending{};
+static bool wifiWaiting=false,wifiCheckingIdentity=false;
+static uint8_t wifiSequence=0;
+static void wifiFinish(bool ok,const char*text){motor_wifi::reply(wifiPending.id,ok,text);wifiWaiting=false;}
+static void wifiBusReply(uint8_t source,uint8_t sequence,uint8_t type,const String &payload){
+  if(!wifiWaiting||source!=wifiPending.address||sequence!=wifiSequence)return;
+  if(static_cast<int32_t>(millis()-wifiPending.deadline)>=0){wifiFinish(false,"Request expired");return;}
+  if(wifiCheckingIdentity){
+    unsigned address=0,protocol=0;char uid[17]{};float gear=0,limit=0,ke=0;
+    int fields=sscanf(payload.c_str(),"META,%u,%16[^,],%f,%f,%f,%u",&address,uid,&gear,&limit,&ke,&protocol);
+    if(fields!=6){ke=0;fields=sscanf(payload.c_str(),"META,%u,%16[^,],%f,%f,%u",&address,uid,&gear,&limit,&protocol);}
+    if(type!=BUS_TYPE_RESPONSE||(fields!=5&&fields!=6)||(protocol!=2&&protocol!=3)||
+       (protocol==3&&(!(ke>0)||!isfinite(ke)))||address!=source||strcasecmp(uid,wifiPending.uid)||
+       !gateway::allowed(wifiPending.command,gear,limit)){
+      wifiFinish(false,"Identity/protocol/target rejected; no motion sent");return;
+    }
+    wifiCheckingIdentity=false;wifiSequence=++busSequence;
+    busStartTransaction(source,wifiSequence,String(wifiPending.command));
+    return;
+  }
+  const String ack=String("ACK,")+String(sequence)+",";
+  const bool query=gateway::readOnly(wifiPending.command);
+  const bool accepted=payload.startsWith(ack)&&payload.indexOf(",executed=")<0;
+  const bool validQuery=query&&((!strcmp(wifiPending.command,"ping")&&type==BUS_TYPE_PONG&&payload.startsWith("PONG,"))||(!strcmp(wifiPending.command,"status")&&type==BUS_TYPE_STATUS&&payload.startsWith("STATUS,"))||(!strcmp(wifiPending.command,"gatewayinfo")&&type==BUS_TYPE_RESPONSE&&payload.startsWith("META,")));
+  wifiFinish(validQuery||accepted,payload.c_str());
+}
+static void wifiControlTick(){
+  if(wifiWaiting){
+    if(static_cast<int32_t>(millis()-wifiPending.deadline)>=0){
+      if(busTransactionActive&&busPendingSequence==wifiSequence)busTransactionActive=false;
+      wifiFinish(false,"DATA timeout; no confirmed result");
+    }
+    return;
+  }
+  if(!motor_wifi::take(wifiPending))return;
+  linkIndicator.activity(millis());
+  if(static_cast<int32_t>(millis()-wifiPending.deadline)>=0){wifiFinish(false,"Expired queued request");return;}
+  const bool query=gateway::readOnly(wifiPending.command);
+  const bool stopping=!strcmp(wifiPending.command,"stop");
+  // Explicit transport exclusion: phone must not fight an open USB console.
+  if(!query&&!stopping&&Serial){wifiFinish(false,"USB console connected; disconnect it before phone control");return;}
+  if(syncMotionArmed&&!query&&!stopping){wifiFinish(false,"Stop synchronized motion before manual control");return;}
+  if(wifiPending.address!=busAddress){
+    if(busTransactionActive){wifiFinish(false,"DATA busy; request not sent");return;}
+    if(!query&&!stopping&&!wifiPending.uid[0]){wifiFinish(false,"Read identity first");return;}
+    wifiWaiting=true;wifiCheckingIdentity=!query&&!stopping;wifiSequence=++busSequence;
+    busStartTransaction(wifiPending.address,wifiSequence,wifiCheckingIdentity?String("gatewayinfo"):String(wifiPending.command));return;
+  }
+  char uid[17];snprintf(uid,sizeof(uid),"%llX",static_cast<unsigned long long>(ESP.getEfuseMac()));
+  if(!query&&!stopping&&strcasecmp(uid,wifiPending.uid)){wifiFinish(false,"Read identity first");return;}
+  if(!gateway::allowed(wifiPending.command,motorProfileGearRatio,modelCurrentLimitAmps)){wifiFinish(false,"Command or target rejected");return;}
+  char result[256];
+  if(!strcmp(wifiPending.command,"gatewayinfo")||!strcmp(wifiPending.command,"ping")){
+    snprintf(result,sizeof(result),"META,%u,%s,%.4f,%.3f,%.6f,3",busAddress,uid,
+             motorProfileGearRatio,modelCurrentLimitAmps,modelKeVoltSecondsPerRad);
+    wifiFinish(true,result);return;
+  }
+  if(!strcmp(wifiPending.command,"status")){
+    snprintf(result,sizeof(result),"STATUS,%u,%.2f,%.2f,%.2f,%.0f,%u,%d,%d,%u,%.1f,%u,%.2f",busAddress,encoderLastSingleTurnDegrees,encoderMultiTurnDegrees,modelControlActive?cascadeBusVoltage:readBusVoltage(),latestCurrentMilliamps,pwmDuty(),digitalRead(PIN_NFAULT),driverAwake,currentStep,encoderVelocityDegreesPerSecond,controlMode,modelTargetForTelemetry());
+    wifiFinish(true,result);return;
+  }
+  Console.beginCommandResult();handleCommand(String(wifiPending.command));
+  const bool accepted=Console.endCommandResult();wifiFinish(accepted,accepted?"Accepted; bounded lease, no auto-renew":"Rejected; inspect controller status");
+}
+
 void setup() {
   // Configure safe output levels before enabling the driver.
   pinMode(PIN_ENBL, OUTPUT);   digitalWrite(PIN_ENBL, LOW);
@@ -4624,6 +4963,7 @@ void setup() {
   printMotorProfile();
   printHelp();
   printStatus();
+  motor_wifi::begin(busAddress,ESP.getEfuseMac());
   // Arduino feeds this task once per loop(). A blocked control loop resets
   // into the asleep/PWM=0 boot state; this is not an electrical E-stop.
   if (esp_task_wdt_init(1, true) == ESP_OK) {
@@ -4690,15 +5030,22 @@ void loop() {
   busProcessRx();
   syncTick();
   busTransactionTick();
+  wifiControlTick();
+  // A DATA-only peer and a phone-connected board need the same steady
+  // indication as the USB entry. No blinking or dependency on motor power.
+  digitalWrite(PIN_LED, (ledOverride<0 ? linkIndicator.lit(bool(Serial),millis()) : ledOverride!=0) ? HIGH : LOW);
   // Dump traces only after the actuator stops, one bounded line per loop.
   // High-rate measurements are stored in RAM, never streamed in the ISR/task.
   if (currentTraceDumping && !modelControlActive && pwmDuty() == 0 && Console.pendingBytes() < 1000) {
     if (currentTraceDumpIndex < currentTraceCount) {
       const auto &sample = currentTrace[currentTraceDumpIndex++];
-      Console.printf("T,%llu,%.5f,%.5f,%.1f,%.4f,%.3f,%lu,%.3f\n", static_cast<unsigned long long>(sample.us),
+      Console.printf("T,%llu,%.5f,%.5f,%.1f,%.4f,%.3f,%lu,%.3f,%.5f,%.0f,%.3f,%.1f,%.1f,%lu\n", static_cast<unsigned long long>(sample.us),
                      sample.referenceA, sample.measuredA, sample.priorPwm,
                      sample.rotorPositionDeg, sample.rotorVelocityDps,
-                     static_cast<unsigned long>(sample.encoderAgeUs), sample.busV);
+                     static_cast<unsigned long>(sample.encoderAgeUs), sample.busV,
+                     sample.rawMeasuredA, sample.dtUs, sample.emfVoltage,
+                     sample.requestedPwm, sample.appliedPwm,
+                     static_cast<unsigned long>(sample.flags));
     } else {
       Console.printf("TRACE_END count=%u\n", static_cast<unsigned>(currentTraceCount));
       currentTraceDumping = false;

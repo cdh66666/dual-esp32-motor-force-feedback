@@ -1,4 +1,5 @@
 .pio/
+firmware/include/dashboard_assets.generated.h
 __pycache__/
 *.pyc
 *.log
@@ -14,5 +15,7 @@ evidence/private/
 !.env.example
 .venv/
 node_modules/
+web/device_ids.local.json
+web/device_ids.local.tmp
 # Raw captures stay local; selected release evidence is explicitly force-added.
 evidence/**

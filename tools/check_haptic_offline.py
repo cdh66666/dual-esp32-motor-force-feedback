@@ -18,6 +18,7 @@ CASES = [
     ('control-math', ['cmd', '/c', 'tests\\control_math_test.cmd'], ROOT),
     ('haptic-math-simulated-mechanics', ['cmd', '/c', 'tests\\haptic_knob_test.cmd'], ROOT),
     ('server-fake-serial-contracts', [sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'server*test.py'], ROOT),
+    ('chain-gateway-cache', [sys.executable, 'tests/chain_gateway_cache_test.py'], ROOT),
     ('session-fake-serial-lifecycle', [sys.executable, 'tests/server_session_lifecycle_test.py'], ROOT),
     ('browser-data-contract', ['node', 'tests/dashboard_data_contract_test.js'], ROOT),
     ('browser-timed-motion-and-throttle', ['node', 'tests/timed_motion_reset_smoke.js'], ROOT),

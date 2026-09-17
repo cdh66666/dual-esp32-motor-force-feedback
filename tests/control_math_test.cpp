@@ -1,5 +1,7 @@
 #include "../firmware/include/control_math.h"
 #include "../firmware/include/usb_tx_policy.h"
+#include "../firmware/include/command_result.h"
+#include "../firmware/include/gateway_command.h"
 #include <assert.h>
 #include <stdio.h>
 #include <thread>
@@ -7,6 +9,84 @@
 using namespace motor_control;
 
 int main() {
+  assert(gateway::allowed("posout -3600 4095 1000",5.2f,1.5f));
+  assert(gateway::allowed("recover",5.2f,1.5f));
+  assert(gateway::allowed("current 1000 4095 1000",5.2f,1.5f));
+  assert(!gateway::allowed("current 1000 4095 1000",5.2f,.5f));
+  assert(!gateway::allowed("current nan 4095 1000",5.2f,1.5f));
+  assert(!gateway::allowed("velocity 30000 4095 1000",5.2f,1.5f));
+  assert(!gateway::allowed("posout 0 4095 30000",5.2f,1.5f));
+  assert(!gateway::allowed("posout 0 4095 1000 extra",5.2f,1.5f));
+  assert(!gateway::allowed("bus all wake",5.2f,1.5f));
+  assert(gateway::allowed("sync status",5.2f,1.5f));
+  assert(gateway::allowed("sync force 184 18 .35 0 1200 4095 30000 36000",5.2f,1.5f));
+  assert(!gateway::allowed("sync force 184 18 .35 0 1201 4095 30000 0",5.2f,1.5f));
+  assert(!gateway::allowed("sync force 184 18 .35 0 1200 4095 30000 36001",5.2f,1.5f));
+  gateway::CommandResult result;
+  auto observe=[&](const char *text){while(*text)result.observe(*text++);};
+  result.begin();observe("ERR driver sleeping\n");assert(!result.finish());
+  result.begin();observe("INFO preparation\nOK model_current target=1\n");assert(result.finish());
+  result.begin();observe("OK partial\nERR rejected\n");assert(!result.finish());
+  result.begin();observe("INFO no acceptance\n");assert(!result.finish());
+  result.begin();observe("OK");observe(" motion=cw\r\n");assert(result.finish());
+  assert(emfVelocityEstimate(100, 200, 0) == 100);
+  assert(emfVelocityEstimate(100, NAN, .001f) == 100);
+  float emfFull=emfVelocityEstimate(0, 1000, .001f);
+  float emfSplit=emfVelocityEstimate(emfVelocityEstimate(0,1000,.0003f),1000,.0007f);
+  assert(fabsf(emfFull-emfSplit)<.001f);
+  float emfRamp=0;
+  for(int i=1;i<=2000;i++)emfRamp=emfVelocityEstimate(emfRamp,18000.f*i*.0005f,.0005f);
+  // 10 ms feed-forward lag at the configured acceleration: <0.04 V for Ke=.011.
+  assert((18000.f-emfRamp)*.01745329252f*.011f < .04f);
+  assert(positionVelocityReference(0, 1000, 0, 80) == 80);
+  assert(positionVelocityReference(1000, 100, 900, 80) == 100);
+  assert(positionVelocityReference(1000, -1000, 900, 80) == 0);
+  assert(positionVelocityReference(0, -1000, 900, 80) == 0);
+  assert(positionVelocityReference(0, -1000, 20, 80) == -80);
+  assert(positionVelocityReference(-1000, -100, -900, 80) == -100);
+  assert(positionVelocityReference(-1000, 1000, -900, 80) == 0);
+  assert(fabsf(gearedPositionDeadband(.25f,5.2f,.5f)-2.6f)<1e-5f);
+  assert(positionSettledHysteresis(false,2.5f,6.0f,2.6f,.52f,8,20));
+  assert(positionSettledHysteresis(true,3.0f,19.0f,2.6f,.52f,8,20));
+  assert(!positionSettledHysteresis(true,3.2f,10.0f,2.6f,.52f,8,20));
+  float filteredError=0;
+  for(int n=0;n<100;n++)filteredError=bilateralVelocityError(filteredError,n%2?50.0f:-50.0f,5000,true);
+  assert(fabsf(filteredError)<30.0f);
+  filteredError=bilateralVelocityError(filteredError,100.0f,5000,true);
+  assert(filteredError>70.0f);
+  PositionTrajectoryState trajectory{0.0f, 0.0f, 0.0f};
+  int trajectoryTicks = 0;
+  for (; trajectoryTicks < 2000 && trajectory.positionDeg < 234.0f;
+       ++trajectoryTicks) {
+    const auto next = positionTrajectoryStep(trajectory, 234.0f, 28080.0f,
+        40000.0f, 300000.0f, 8.0f, 0.005f);
+    assert(next.positionDeg <= 234.001f);
+    assert(fabsf(next.velocityDps) <= 28080.001f);
+    assert(fabsf(next.accelerationDps2) <= 40000.001f);
+    if (next.positionDeg != 234.0f) {
+      assert(fabsf(next.accelerationDps2 - trajectory.accelerationDps2) <=
+             1500.01f);
+    }
+    trajectory = next;
+  }
+  assert(trajectory.positionDeg == 234.0f && trajectory.velocityDps == 0.0f);
+  assert(trajectoryTicks < 400); // reference completes within 2 s in software
+  const auto reverseTrajectory = positionTrajectoryStep(
+      {10.0f, 100.0f, 0.0f}, -20.0f, 28080.0f, 40000.0f,
+      300000.0f, 8.0f, 0.005f);
+  assert(reverseTrajectory.positionDeg > 10.0f &&
+         reverseTrajectory.positionDeg < 11.0f);
+  assert(fabsf(positionVelocityTrackingCommand(20, 18, 100, 90, 8, .2f) -
+                118.0f) < 1e-5f);
+  assert(fabsf(positionVelocityTrackingCommand(20, 18, 100, 90, 8, .2f, 2.0f) -
+                118.0f) < 1e-5f);
+  assert(fabsf(positionVelocityTrackingCommand(20, 18, -100, -90, 8, .2f, 2.0f) +
+                88.0f) < 1e-5f);
+  assert(positionVelocityTrackingCommand(NAN, 18, 100, 90, 8, .2f) == 0);
+  assert(positionVelocityTrackingCommand(20, 18, -100, -90, 8, .2f, NAN) == 0);
+  const auto missedTrajectoryTick = positionTrajectoryStep(
+      trajectory, -10, 28080, 40000, 300000, 8, .05f);
+  assert(missedTrajectoryTick.positionDeg == trajectory.positionDeg);
   // Reproduce yesterday's stationary, 360 deg/s request. With the OLD
   // ordering the 0.1 A static term froze I at roughly 0.145 A indefinitely.
   float integral = 0, applied = 0;
@@ -50,6 +130,14 @@ int main() {
   assert(next == 800 && !takeDeadline(750, next, 500));
   assert(!takeDeadline(1000, next, 0));
   assert(lowPassAlpha(0, 1000) == 0);
+  const float encoderCountDeg = 360.0f / 16384.0f;
+  const float lowSpeedSpike = encoderVelocityDelta(
+      encoderCountDeg, 0.0f, encoderCountDeg * 1000.0f,
+      1800.0f, 0.65f);
+  assert(fabsf(lowSpeedSpike - encoderCountDeg * 0.35f) < 1e-7f);
+  const float highSpeedIncrement = encoderVelocityDelta(
+      encoderCountDeg, 0.0f, 1800.0f, 1800.0f, 0.65f);
+  assert(highSpeedIncrement == encoderCountDeg);
   const float fullAlpha = lowPassAlpha(1000, 1522.05f);
   const float firstAlpha = lowPassAlpha(300, 1522.05f);
   const float secondAlpha = lowPassAlpha(700, 1522.05f);

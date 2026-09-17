@@ -5,6 +5,7 @@ let chromium;
 try { ({chromium}=require('playwright')); }
 catch { ({chromium}=require('C:/Users/admin/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright')); }
 (async()=>{
+  const targetPort=process.env.MOTOR_READONLY_PORT || 'COM23';
   const browser=await chromium.launch({headless:true,executablePath:'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'});
   try {
   const page=await browser.newPage({viewport:{width:1500,height:1120}});
@@ -12,7 +13,16 @@ catch { ({chromium}=require('C:/Users/admin/.cache/codex-runtimes/codex-primary-
   page.on('pageerror',e=>errors.push(e.message));
   await page.route('**/api/**',async route=>{
     const request=route.request();
+    // Port enumeration can ask the backend to reconnect an inactive sibling;
+    // keep that transport-only housekeeping inside the read-only fixture.
+    if(request.method()==='POST' && request.url().endsWith('/connect'))
+      return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({ok:true})});
     if(request.method()==='POST'){
+      // The single-USB chain transport performs identity/telemetry discovery
+      // through read-only chain endpoints. They are transport reads, not
+      // actuator writes, and must remain visible to this live fixture.
+      if(request.url().endsWith('/chain/topology') || request.url().endsWith('/chain/query'))
+        return route.continue();
       const body=request.postDataJSON();
       const readCommand=/^(model|motorprofile status|cascade status|knob status|status|diag|businfo|stream 100)$/;
       if(!request.url().endsWith('/send') || !readCommand.test(body.command||'')){
@@ -23,11 +33,11 @@ catch { ({chromium}=require('C:/Users/admin/.cache/codex-runtimes/codex-primary-
     }
     return route.continue();
   });
-  await page.goto('http://127.0.0.1:8766/?focus=COM23&v=readonly-commissioning');
+  await page.goto('http://127.0.0.1:8766/?focus='+encodeURIComponent(targetPort)+'&v=readonly-commissioning');
   await page.click('#advancedToggle');
-  await page.waitForSelector('[data-port="COM23"] [data-metric="rate"]');
+  await page.waitForSelector('[data-port="'+targetPort+'"] [data-metric="rate"]');
   await page.waitForTimeout(3200);
-  const root=page.locator('[data-port="COM23"]');
+  const root=page.locator('[data-port="'+targetPort+'"]');
   const before=writes.length;
   await root.locator('[data-window="positionTarget"]').selectOption('1');
   await page.locator('#unit').selectOption('deg');
@@ -47,14 +57,15 @@ catch { ({chromium}=require('C:/Users/admin/.cache/codex-runtimes/codex-primary-
     canvases:[...element.querySelectorAll('[data-chart] canvas')].map(c=>[c.width,c.height]),
     overflow:document.documentElement.scrollWidth>window.innerWidth+2,
     modal:!document.querySelector('#errorModal').hidden
+    ,remoteBoards:[...document.querySelectorAll('.board[data-port^="DATA-"]')].map(board=>({port:board.dataset.port,connected:board.querySelector('[data-connected]')?.textContent}))
   }));
   const output=path.resolve(process.env.MOTOR_UI_EVIDENCE || 'evidence/commissioning/20260905-dashboard-live.png');
   await page.screenshot({path:output,fullPage:true});
   assert.equal(blocked.length,0);assert.deepEqual(errors,[]);
   assert.equal(before,afterView,'view changes sent commands');
-  assert.match(state.rates,/100\.\d Hz/);
+  assert.match(state.rates,/100\.\d+ Hz/);
   const readBack=async command => (await (await page.request.post('http://127.0.0.1:8766/api/send',
-    {data:{port:'COM23',command,wait_ack:true}})).json()).reply;
+    {data:{port:targetPort,command,wait_ack:true}})).json()).reply;
   const config=await readBack('cascade status');
   const knob=await readBack('knob status');
   assert.equal(Number(state.currentKi),Number(config.match(/current_hz=\d+ kp=\S+ ki=(\S+)/)[1]));
@@ -63,6 +74,7 @@ catch { ({chromium}=require('C:/Users/admin/.cache/codex-runtimes/codex-primary-
   assert.equal(Number(state.knobStrength),Number(knob.match(/peak_mA=([\d.]+)/)[1]));
   assert(!state.overflow && !state.modal);
   assert(state.canvases.length===5 && state.canvases.every(([w,h])=>w>100&&h>100));
+  if(process.env.MOTOR_EXPECT_CHAIN==='1') assert(state.remoteBoards.length>0,'single-USB DATA peer was not rendered');
   console.log(JSON.stringify({state,readCommands:writes,errors,blocked,screenshot:output}));
   } finally { await browser.close(); }
 })().catch(e=>{console.error(e);process.exit(1);});

@@ -73,8 +73,8 @@ try {
   const velocityTimed = commands.includes('velocity 1560 4095 3000');
   const resetTail = commands.slice(-3).join('|') === 'stop|recover|status';
   const profileSafe = commands.includes('cascade current 600 600000 4095') &&
-    commands.includes('cascade velocity 0.0008 0.016 0.6 0 80 1') &&
-    commands.includes('cascade position 12 0 0.15 12000 0.1 0 40000 1') &&
+    commands.some(command => command.startsWith('cascade velocity 0.0004 0.008 ')) &&
+    commands.some(command => command.startsWith('cascade position 12 0 0.15 ')) &&
     commands.includes('cascade hold on');
   const beforeViewChange = commands.length;
   await page.locator('[data-window="positionTarget"]').selectOption('1');

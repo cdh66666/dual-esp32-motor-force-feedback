@@ -116,6 +116,8 @@ class ContractTest(unittest.TestCase):
                         'knob config 0 nan 100 1 90', 'knob config 0 15 100 1 inf',
                         'knob config 0 15 200 1 90 extra', 'knob start 0', 'knob keep -1']:
             with self.assertRaises(ValueError): server.validate_command(command)
+    def test_remote_recovery_command_contract(self):
+        self.assertEqual(server.validate_command('bus 1 recover'), 'bus 1 recover')
     def test_uncertain_knob_start_and_keep_are_stopped(self):
         for command in ['knob start 1', 'knob keep 1', 'posout 1 4095 1000']:
             s = self.session()
@@ -154,6 +156,34 @@ class ContractTest(unittest.TestCase):
                     'cascade cogging enable 1 nan 0',
                     'cascade cogging harmonic 1 0.5 0']:
             with self.assertRaises(ValueError): server.validate_command(bad)
+    def test_single_usb_force_configuration_is_typed_and_bounded(self):
+        remote={'address':1,'protocol':3,'gear':5.2,'current_limit':1.5,'model_ke':.011}
+        peer={'address':184,'protocol':3,'gear':5.2,'current_limit':1.5,'model_ke':.011}
+        command=server.remote_force_command({
+            'peer':184,'stiffness':18,'damping':.35,'reflection':0,
+            'limit':1200,'duty':4095,'timeout':30000,'offset':36000,
+        },remote,peer)
+        self.assertEqual(command,'sync force 184 18 0.35 0 1200 4095 30000 36000')
+        for body in (
+            {'peer':184,'stiffness':18,'damping':.35,'reflection':0,'limit':1201,'duty':4095,'timeout':30000,'offset':0},
+            {'peer':1,'stiffness':18,'damping':.35,'reflection':0,'limit':1200,'duty':4095,'timeout':30000,'offset':0},
+        ):
+            with self.assertRaises(ValueError): server.remote_force_command(body,remote,peer)
+        with self.assertRaises(ValueError): server.remote_force_command(
+            {'peer':184,'stiffness':18,'damping':.35,'reflection':0,'limit':1200,'duty':4095,'timeout':30000,'offset':0},
+            {**remote,'protocol':2},peer)
+        with self.assertRaises(ValueError): server.validate_command('sync force 184 18 .35 0 1200 4095 30000 36001')
+    def test_single_usb_force_status_requires_full_valid_frame(self):
+        fields=server.parse_chain_status('STATUS,1,0,0,24.2,0,0,1,1,0,0,0,0',1)
+        self.assertEqual(fields[3],24.2)
+        self.assertEqual(fields[6],1)
+        for reply in ('STATUS,1,0,0,24.2,0,0,1,1',
+                      'STATUS,1,0,0,nan,0,0,1,1,0,0,0,0',
+                      'STATUS,2,0,0,24.2,0,0,1,1,0,0,0,0'):
+            with self.assertRaises(ValueError): server.parse_chain_status(reply,1)
+        self.assertEqual(server.parse_usb_status(
+            'STATUS bus=24.25V bus_adc=25000mV angle=0.00deg multi=0.00deg velocity=0.0deg/s raw=1 nFAULT=1 awake=1 step=0 pwm=0/4095'),
+            {'bus':24.25,'fault':1,'awake':1})
     def test_timeout_stops_uncertain_motion(self):
         s = self.session()
         with self.assertRaises(TimeoutError): s.send_checked('velocity 360 4095 1000', timeout=.03)

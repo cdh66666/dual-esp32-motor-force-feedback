@@ -5,14 +5,15 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>双电机力反馈 · 实时控制</title>
   <link rel="stylesheet" href="/dashboard.css?v=36gp-commissioned-20260905">
-  <link rel="stylesheet" href="/dashboard-cascade.css?v=red-targets-20260909">
+  <link rel="stylesheet" href="/dashboard-cascade.css?v=basic-calibration-20260914">
 </head>
 <body class="simple-mode">
   <header class="topbar">
     <div><h1>双电机 · 力反馈</h1><p id="simpleConnection">正在检测设备…</p></div>
     <div class="top-actions">
+      <button id="chainOpen" disabled title="网关后台与固件部署尚未完成">总线设备 · 待部署</button>
       <label>显示单位 <select id="unit"><option value="deg">° / °/s</option><option value="rev" selected>圈 / rps</option></select></label>
-      <button id="motorSettingsOpen">电机设置</button><button id="connectAll">连接全部</button><button id="stopAll" class="danger">全部 STOP</button><button id="resetAll">复位全部</button>
+      <button id="identifyCapture" class="primary">一键校准</button><button id="motorSettingsOpen">电机设置</button><button id="connectAll">连接 / 接回电脑</button><button id="phoneRelease" disabled title="需要配套后台更新">交给手机 · 待后台更新</button><button id="stopAll" class="danger">全部 STOP</button><button id="resetAll">复位全部</button>
     </div>
   </header>
   <section class="scope-panel" aria-label="双板示波器">
@@ -22,20 +23,20 @@
       <button id="scopeZoomIn" aria-label="横向放大">放大 ＋</button><button id="scopeZoomOut" aria-label="横向缩小">缩小 −</button>
       <button id="scopePause" aria-pressed="false">暂停画面</button><button id="scopeScale" aria-pressed="false">锁定量程</button>
       <button id="scopeReset">复位视图 / 实时</button>
+      <label title="仅显示低通：速度30ms、电流20ms；不修改控制反馈和导出"><input id="scopeSmooth" type="checkbox" checked>显示降噪</label>
     </div>
-    <fieldset id="scopeChannels" data-scope-pane="shared"><legend>显示通道 · 同时应用上下两窗</legend><label><input type="checkbox" data-scope-channel="multi" checked>位置 r</label><label><input type="checkbox" data-scope-channel="velocity">速度 r/s</label><label><input type="checkbox" data-scope-channel="current" checked>电流 A</label><label><input type="checkbox" data-scope-channel="pwm">PWM</label></fieldset>
+    <fieldset id="scopeChannels" data-scope-pane="shared"><legend>显示通道 · 上下两窗跟随手动测试，可勾选叠加</legend><label><input type="checkbox" data-scope-channel="multi" checked>位置 r</label><label><input type="checkbox" data-scope-channel="velocity">速度 r/s</label><label><input type="checkbox" data-scope-channel="current">电流 A</label><label><input type="checkbox" data-scope-channel="pwm">PWM</label></fieldset>
     <details class="scope-axis-options"><summary>纵轴调整</summary><div class="scope-toolbar scope-secondary"><label>纵向调整 <select id="scopePane"><option value="0">上窗</option><option value="1">下窗</option></select><select id="scopeYChannel" aria-label="纵向调整通道"><option value="current">电流</option><option value="velocity">速度</option><option value="multi">位置</option><option value="pwm">PWM</option></select></label><button id="scopeYIn">纵向 ＋</button><button id="scopeYOut">纵向 −</button><span id="scopeViewState">实时 · 共享时间轴</span></div></details>
-    <small>实线：实测　<span class="scope-target-key">红色虚线：目标</span>（力反馈位置为对端参考）</small>
+    <small>降噪开启：亮线为平滑速度/电流，淡线为原遥测；数字/导出保留原值。<span class="scope-target-key">红虚线：目标</span></small>
     <div id="scopeLegend" class="scope-legend" aria-live="off"></div>
     <div id="scopeCursor" class="scope-caption">滚轮缩放时间 · Shift＋滚轮缩放所选通道 · 拖动查看历史 · 双击回到实时。仅改变显示，不控制电机。</div>
     <canvas id="scopeCanvas" aria-label="上下两个电机窗格；滚轮横向缩放，Shift 加滚轮纵向缩放，拖动查看历史，双击复位"></canvas>
     <div id="quickControl" class="quick-control">
       <div class="scope-toolbar"><strong>手动测试</strong><label>控制对象 <select id="quickBoard"><option value="both">两台同时</option><option value="0">仅上窗电机</option><option value="1">仅下窗电机</option></select></label><button id="quickStop" class="danger">停止测试</button></div>
       <div id="quickRows"></div>
-      <p id="quickState" role="status">拖动即控制所选电机；每台同时只运行一种模式。位置为输出轴多圈坐标，范围 ±10 圈。</p>
+      <p id="quickState" role="status">拖动即控制，每台只运行一种模式。PWM 为开环，最后更新后 1 秒归零；保留硬件保护和额定电压限幅，不保证恒流。</p>
     </div>
   </section>
-  <section class="auto-panel" aria-labelledby="autoTitle">
     <dialog id="motorSettingsWindow" aria-labelledby="motorSettingsTitle">
     <div class="settings-window-bar"><strong id="motorSettingsTitle">电机设置</strong><button id="motorSettingsClose" type="button" aria-label="关闭电机设置">关闭</button></div>
     <form id="motorSettings" class="motor-settings">
@@ -47,14 +48,15 @@
       <small id="motorSettingsState" role="status">等待板端回读；输入框不是已保存值。电源为 20 V / 3 A，两台共用；36GP 暂不开放超过 2 A 的未验证上限。</small>
     </form>
     </dialog>
-    <div><h2 id="autoTitle">基本检查</h2><p>固定电机、松开手柄。逐台低速正反转，检查方向、速度跟随和工作电流；保留现有控制参数，不再自动覆盖三环参数。</p></div>
-    <button id="identifyCapture" class="primary">检查方向与基本响应</button>
+  <dialog id="calibrationWindow" aria-labelledby="autoTitle" class="calibration-window">
+    <div class="settings-window-bar"><h2 id="autoTitle">基础校准</h2><button id="calibrationClose" type="button">关闭</button></div>
+    <p>校准静止电流零点、检查编码器和回读电机配置；不旋转电机，不覆盖控制增益或方向。</p>
     <button id="analyzeCapture">分析已有采集 · 不转动电机</button>
     <button id="autoTune" class="legacy-tune" hidden>实验性参数比较（未验收）</button>
     <p id="autoState" role="status" aria-live="polite">等待开始；需要配套的滑行停止固件。不会自动恢复旧参数或运动。</p>
     <progress id="autoProgress" max="100" value="0" aria-label="自动整定进度"></progress>
     <details><summary>测试结果</summary><pre id="autoReport">暂无本次测试结果</pre></details>
-  </section>
+  </dialog>
   <details class="multi-tools" open><summary>双板联动 · 双向力反馈</summary>
   <section class="fleet">
     <strong>双板同步操作</strong>
@@ -86,6 +88,22 @@
       <button id="errorClose" class="danger">关闭</button>
     </div>
   </div>
-  <script type="module" src="/dashboard.js?v=position-current-authority-20260909"></script>
+  <dialog id="chainWindow" class="calibration-window">
+    <h2>单 USB · DATA 远端设备</h2>
+    <p>两台电机均可在主界面查看和手动测试；此窗口用于总线发现和诊断，不自动启动电机。</p>
+    <label>接入 USB <select id="chainPort"></select></label><button id="chainScan">快速发现两板</button><button id="chainScanAll">完整扫描 1–254</button><button id="chainCancel">结束扫描</button>
+    <details><summary>设备 ID 设置</summary>
+      <p>修改所选 USB 板的 ID。改号时两根 USB 都需接入；先停止两板、检查冲突，再保存回读。改完可恢复单 USB。热点入口 ID 在板子下次重启后更新。</p>
+      <button id="chainIdRead">读取所选板 ID</button><span id="chainIdIdentity">尚未读取</span>
+      <label>新 ID <input id="chainNewId" type="number" min="1" max="254" step="1"></label><button id="chainIdSave">停止两板并保存 ID</button>
+    </details>
+    <details id="chainWifi"><summary>手机热点连接信息</summary><button id="chainWifiRead">读取所选 USB 板热点</button><p id="chainWifiState" role="status">免密码热点；手机连接后点击登录提示打开网页。只查询，不唤醒电机。</p></details>
+    <label>远端 <select id="chainDevices"></select></label><button id="chainRead">读取状态</button>
+    <p>短时测试：每次命令有效 1 秒，不自动续发。设备 ID 显示在远端列表中。</p>
+    <label>模式 <select id="chainMode"><option value="position">位置 r（±10）</option><option value="velocity">速度 r/s（±15）</option><option value="current">电流 A（±1，受板端限制）</option><option value="recover">恢复远端保护（停机后）</option></select></label>
+    <label>目标 <input id="chainValue" type="number" step="0.01" value="0"></label><button id="chainApply">执行 1 秒</button>
+    <p id="chainState" role="status">发现设备不会唤醒或转动电机。</p><button id="chainStop" class="danger">全链 STOP</button><button id="chainClose">关闭</button>
+  </dialog>
+<script type="module" src="/dashboard.js?v=control-smooth-chain-20260916"></script>
 </body>
 </html>

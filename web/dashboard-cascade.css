@@ -114,12 +114,27 @@ body.tuning .multi-tools,body.tuning #boards { pointer-events:none; opacity:.5; 
 .simple-mode .quick-control { padding-top:3px;margin-top:4px; }
 .simple-mode #scopeCanvas { height:clamp(300px,calc(100dvh - 370px),540px); }
 .scope-target-key { color:#ff4055;font-weight:700; }
+.calibration-window { width:min(620px,90vw);max-height:80dvh;overflow:auto;background:#142433;color:#ddecf5;border:1px solid #345469;border-radius:14px;padding:22px; }
+.calibration-window::backdrop { background:#0009; }
+.calibration-window progress { width:100%; }
+.calibration-window pre { white-space:pre-wrap;overflow-wrap:anywhere; }
 @media(max-height:720px) {
-  .simple-mode #scopeCanvas { height:240px; }
+  .simple-mode #scopeCanvas { height:210px; }
 }
 .simple-mode .topbar { padding-bottom:4px; }
 .simple-mode .topbar h1 { font-size:20px; }
 .simple-mode .topbar p { margin:2px 0; }
 .simple-mode .top-actions button { padding:7px 10px;font-size:12px; }
 #quickState { margin:2px 0;font-size:11px; }
+.wifi-mode #chainOpen { display:none; }
+@media(max-width:650px){
+  .simple-mode .scope-panel{margin:8px;padding:10px;}
+  .simple-mode .topbar{padding:10px;}
+  .simple-mode .scope-toolbar{gap:5px;flex-wrap:wrap;}
+  .simple-mode #scopeCanvas{height:280px;min-width:0;}
+  .simple-mode .quick-row{grid-template-columns:64px minmax(0,1fr) 70px;}
+  .simple-mode .quick-row input{min-width:0;touch-action:pan-y;}
+  .simple-mode .multi-tools{width:auto;min-width:0;margin:8px;}
+  .simple-mode .haptic{width:auto;min-width:0;margin:0;padding:10px;}
+}
 @media(max-width:650px) { .quick-row { grid-template-columns:70px minmax(60px,1fr) 78px;gap:6px; } }

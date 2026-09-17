@@ -25,7 +25,10 @@ catch { ({chromium}=require('C:/Users/admin/.cache/codex-runtimes/codex-primary-
   await page.waitForSelector('[data-port="FAKE"]');
   const result=await page.evaluate(async()=>{
    const source=await(await fetch('/dashboard.js')).text();
-   const declarations=source.slice(0,source.indexOf("$('#unit').addEventListener"));
+   const declarations=source.slice(0,source.indexOf("$('#unit').addEventListener"))
+    .replaceAll("import('/gateway-transport.js')", "import('http://127.0.0.1:18766/gateway-transport.js')")
+    .replaceAll("import('/usb-chain-transport.js')", "import('http://127.0.0.1:18766/usb-chain-transport.js')")
+    .replaceAll("import('/remote-motion-lease.js')", "import('http://127.0.0.1:18766/remote-motion-lease.js')");
    const m=await import(URL.createObjectURL(new Blob([declarations+'\nexport {boards,initialBoard,reportLinkIssue,recoverConnection,showErrorModal,api,refreshPorts};'],{type:'text/javascript'})));
    const board=m.initialBoard('FAKE');board.root=document.querySelector('[data-port="FAKE"]');
    board.active=true;board.lastTelemetryAt=Date.now();m.boards.set('FAKE',board);

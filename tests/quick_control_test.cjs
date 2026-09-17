@@ -9,14 +9,26 @@ let chromium;try{({chromium}=require('playwright'));}catch{({chromium}=require('
   await page.goto('http://127.0.0.1:18766/');
   const source=fs.readFileSync('web/dashboard.js','utf8');
   const result=await page.evaluate(async code=>{
-   const $=(s,r=document)=>r.querySelector(s),commands=[],forceSession={active:false},fmt=v=>Number(v).toFixed(2);
+   const $=(s,r=document)=>r.querySelector(s),commands=[],forceSession={active:false},wifiTransport=null,fmt=v=>Number(v).toFixed(2);
    const boards=new Map(['A','B'].map(port=>[port,{port,active:true,sessionId:port,motionGeneration:0,lastTelemetryAt:Date.now(),latest:{multi:100},motorSettings:{current:.5},targetLimits:{velocityTarget:4000,positionTarget:36000}}]));
    const clearMotionTimers=()=>{};
-   let failure=false;
+   let failure=false,delayA=0,inFlight=0,maxInFlight=0;
    const send=async(port,command)=>{commands.push([port,command]);};
-   const runMotion=async(b,mode,value,generation)=>{if(failure&&b.port==='B')throw Error('B rejected');if(generation!==b.motionGeneration)return;commands.push([b.port,mode,value]);b.activeMotion={mode};};
+   const runMotion=async(b,mode,value,generation)=>{inFlight++;maxInFlight=Math.max(maxInFlight,inFlight);try{if(delayA&&b.port==='A')await new Promise(r=>setTimeout(r,delayA));if(failure&&b.port==='B')throw Error('B rejected');if(generation!==b.motionGeneration)return;commands.push([b.port,mode,value]);b.activeMotion={mode};}finally{inFlight--;}};
    eval(code+'\nwindow.testQuick={quickApply,quickStop};');
    const q=window.testQuick;
+   const selected=()=>[...document.querySelectorAll('#scopeChannels input:checked')].map(e=>e.dataset.scopeChannel).join(',');
+   const defaultPosition=selected()==='multi';
+   for(const [mode,key] of [['velocity','velocity'],['current','current'],['position','multi'],['pwm','multi,pwm']]){
+     document.querySelector('#quick-'+mode).dispatchEvent(new Event('input'));
+     if(selected()!==key||$('#scopeYChannel').value!==(mode==='pwm'?'pwm':key))throw Error('Scope did not follow '+mode);
+     await q.quickStop();
+   }
+   document.querySelectorAll('#scopeChannels input').forEach(e=>e.checked=e.dataset.scopeChannel!=='pwm');
+   for(let i=0;i<5;i++)document.querySelector('#quick-pwm').dispatchEvent(new Event('input'));
+   if(selected()!=='multi,velocity,current')throw Error('PWM dragging overwrote manually selected channels');
+   await q.quickStop();
+   commands.length=0;
    document.querySelector('#quick-position').value=.01;
    document.querySelector('#quick-position').dispatchEvent(new Event('input'));
    const previewSilent=commands.length===0;
@@ -36,14 +48,18 @@ let chromium;try{({chromium}=require('playwright'));}catch{({chromium}=require('
    await q.quickStop();commands.length=0;
    $('#quick-position').dispatchEvent(new Event('input'));await q.quickStop();await new Promise(r=>setTimeout(r,100));
    const stopCancelsPending=commands.length===0;
-   return {previewSilent,pair,noResume,single,rollback,forceUntouched,coalesced,stopCancelsPending};
+   commands.length=0;failure=true;delayA=60;maxInFlight=0;
+   await q.quickApply('position',true);
+   const parallelSettled=maxInFlight===2&&inFlight===0&&commands.findIndex(c=>c[1]==='position')<commands.findIndex(c=>c[1]==='stop');
+   return {defaultPosition,previewSilent,pair,noResume,single,rollback,forceUntouched,coalesced,stopCancelsPending,parallelSettled};
   },source.slice(source.indexOf('// Quick controls share'),source.indexOf("$('#unit').addEventListener")));
-  assert(result.previewSilent&&result.noResume&&result.rollback&&result.forceUntouched);
+  assert(result.defaultPosition&&result.previewSilent&&result.noResume&&result.rollback&&result.forceUntouched);
+  assert(result.parallelSettled,'paired dispatch waits for late ACK before rollback');
   assert.equal(result.pair.length,2);assert(result.pair.every(c=>Math.abs(c[2]-3.6)<1e-6));
   assert.equal(result.coalesced.length,2);assert(result.coalesced.every(c=>Math.abs(c[2]-.49*360)<1e-6));assert(result.stopCancelsPending);
   assert.equal(result.single.length,1);assert.equal(result.single[0][0],'B');
   assert.equal(await page.locator('.quick-row button,.quick-row select').count(),0);
-  for(const [mode,limit] of [['position','10'],['velocity','15'],['current','1']])assert.equal(await page.locator('#quick-'+mode).getAttribute('max'),limit);
+  for(const [mode,limit] of [['position','10'],['velocity','15'],['current','1'],['pwm','100']])assert.equal(await page.locator('#quick-'+mode).getAttribute('max'),limit);
   await page.setViewportSize({width:980,height:670});
   const controlBottom=await page.locator('#quickControl').evaluate(e=>e.getBoundingClientRect().bottom);
   assert(controlBottom<=670,`controls bottom ${controlBottom} exceeds 670px viewport`);

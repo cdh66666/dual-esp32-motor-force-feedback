@@ -17,7 +17,10 @@ try {({chromium}=require('playwright'));}catch{({chromium}=require('C:/Users/adm
   await page.goto('http://127.0.0.1:18766/');
   const result=await page.evaluate(async()=>{
     const source=await(await fetch('/dashboard.js')).text();
-    const code=source.slice(0,source.indexOf("$('#unit').addEventListener"));
+    const code=source.slice(0,source.indexOf("$('#unit').addEventListener"))
+      .replaceAll("import('/gateway-transport.js')", "import('http://127.0.0.1:18766/gateway-transport.js')")
+      .replaceAll("import('/usb-chain-transport.js')", "import('http://127.0.0.1:18766/usb-chain-transport.js')")
+      .replaceAll("import('/remote-motion-lease.js')", "import('http://127.0.0.1:18766/remote-motion-lease.js')");
     const m=await import(URL.createObjectURL(new Blob([code+'\nexport {forceSession,scope,boards,scopeRange,scopeSnapshot,drawScope,scopeZoomY,scopeLayout};'],{type:'text/javascript'})));
     const drawn=[],paint=CanvasRenderingContext2D.prototype.fillText;
     CanvasRenderingContext2D.prototype.fillText=function(text,x,y){drawn.push({text:String(text),x,y,color:this.fillStyle,align:this.textAlign,width:this.measureText(text).width});return paint.call(this,text,x,y);};
@@ -28,12 +31,16 @@ try {({chromium}=require('playwright'));}catch{({chromium}=require('C:/Users/adm
     if(data.series[0].samples[0].multi!==1 || data.series[0].samples[0].velocity!==2 || m.boards.get('A').samples[0].multi!==360)throw Error('Display conversion must not mutate control units');
     const aligned=data.series[0].samples.at(-1).wall===data.series[1].samples.at(-1).wall;
     m.scope.frozen=data;m.drawScope(100);
-    if(m.scope.ranges['A:multi'][1]<2 || m.scope.ranges['A:current'][1]<.2)throw Error('Autoscale excludes targets');
+    if(m.scope.ranges['A:multi'][1]<2)throw Error('Autoscale excludes targets');
     const ticks=drawn.filter(r=>/^[+-]?\d+(\.\d+)?(e[+-]?\d+)?$/.test(r.text));
     const headers=drawn.filter(r=>r.text==='电流 A'||r.text==='位置 r');
+    document.querySelector('[data-scope-channel="current"]').checked=true;
+    m.drawScope(200);
+    document.querySelector('#scopeYChannel').value='current';
     const oldRange=[...m.scope.ranges['A:current']];
     m.scopeZoomY(.5,0);
-    const zoomTracks=Math.abs((m.scope.ranges['A:current'][1]-m.scope.ranges['A:current'][0])/(oldRange[1]-oldRange[0])-.5)<1e-9;
+    const zoomRatio=(m.scope.ranges['A:current'][1]-m.scope.ranges['A:current'][0])/(oldRange[1]-oldRange[0]);
+    const zoomTracks=Math.abs(zoomRatio-.5)<1e-9;
     m.scope.ranges['A:current']=oldRange;m.scope.manual.clear();
     const canvas=document.querySelector('#scopeCanvas'),before=canvas.toDataURL();
     m.boards.get('A').samples=[];m.drawScope(200);
@@ -50,12 +57,15 @@ try {({chromium}=require('playwright'));}catch{({chromium}=require('C:/Users/adm
     m.forceSession.active=true;m.scope.frozen=data;m.drawScope(400);
     if(m.scope.frozen!==null || !document.querySelector('#scopePause').disabled)throw Error('Force mode must remain live');
     m.forceSession.active=false;m.drawScope(500);
-    return {aligned,frozen,finite,zoomTracks,ticks:ticks.length,headers:headers.length,fourAxisTicks:fourAxisTicks.length,noClipping,smallSpan:tiny[1]-tiny[0],legend:document.querySelector('#scopeLegend').textContent};
+    return {aligned,frozen,finite,zoomTracks,zoomRatio,ticks:ticks.length,headers:headers.length,fourAxisTicks:fourAxisTicks.length,noClipping,smallSpan:tiny[1]-tiny[0],legend:document.querySelector('#scopeLegend').textContent};
   });
   assert(result.aligned&&result.frozen&&result.finite);
   assert(result.smallSpan<.1);
-  assert.equal(result.ticks,20);assert.equal(result.headers,4);
-  assert.equal(result.fourAxisTicks,40);assert(result.noClipping&&result.zoomTracks);
+  // Position is the default scope channel; other channels are opt-in and
+  // are covered by the four-channel pass below.
+  assert.equal(result.ticks,10);assert.equal(result.headers,2);
+  assert.equal(result.fourAxisTicks,40);
+  if(!result.noClipping||!result.zoomTracks)throw Error('scope geometry '+JSON.stringify({noClipping:result.noClipping,zoomTracks:result.zoomTracks,zoomRatio:result.zoomRatio,fourAxisTicks:result.fourAxisTicks}));
   assert(result.legend.includes('A/div')&&result.legend.includes('r/div'));
   await page.click('#scopePause');assert.equal(await page.locator('#scopePause').getAttribute('aria-pressed'),'true');
   await page.click('#scopeScale');assert.equal(await page.locator('#scopeScale').getAttribute('aria-pressed'),'true');

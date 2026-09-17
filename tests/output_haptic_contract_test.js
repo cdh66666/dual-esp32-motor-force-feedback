@@ -35,7 +35,11 @@ catch { ({chromium} = require('C:/Users/admin/.cache/codex-runtimes/codex-primar
         positionCommand,startKnob,renewKnob,stopAndPrepare,scheduleKnobConfig,knobPreviewMa,
         knobSettings,updateKnobStatus,updateUi,runMotion,ingestLogs,exportCsv,gearOf,updateSliderOutput,drawKnobPreview,drawChart};
         export function unit(value) { displayUnit = value; }`;
-      const m = await import(URL.createObjectURL(new Blob([source.slice(0,cut)+exports],{type:'text/javascript'})));
+      const declarations = source.slice(0,cut)
+        .replaceAll("import('/gateway-transport.js')", "import('http://127.0.0.1:18766/gateway-transport.js')")
+        .replaceAll("import('/usb-chain-transport.js')", "import('http://127.0.0.1:18766/usb-chain-transport.js')")
+        .replaceAll("import('/remote-motion-lease.js')", "import('http://127.0.0.1:18766/remote-motion-lease.js')");
+      const m = await import(URL.createObjectURL(new Blob([declarations+exports],{type:'text/javascript'})));
       const b = m.initialBoard('OFFLINE');
       b.root = document.querySelector('[data-port="OFFLINE"]'); b.active = true;
       b.canvases = Object.fromEntries([...b.root.querySelectorAll('[data-chart]')].map(e=>[e.dataset.chart,e.querySelector('canvas')]));
@@ -64,6 +68,10 @@ catch { ({chromium} = require('C:/Users/admin/.cache/codex-runtimes/codex-primar
       m.parseLine(b,'CAPS output_position=1 knob=1 haptic_protocol=1');
       const newCommand = m.positionCommand(b, 36000);
       const motorGains = ['velocityKp','velocityKi','positionMaxVelocity','positionDeadband'].map(n => m.parameterToMotor(b,n));
+      const velocityRange = {
+        min:Number(b.root.querySelector('[data-slider="velocityTarget"]').min),
+        max:Number(b.root.querySelector('[data-slider="velocityTarget"]').max)
+      };
       m.unit('deg'); m.updateUi(b);
       const degDisplay = b.root.querySelector('[data-metric="multi"]').textContent;
       m.unit('rev'); m.updateUi(b);
@@ -117,7 +125,7 @@ catch { ({chromium} = require('C:/Users/admin/.cache/codex-runtimes/codex-primar
       URL.createObjectURL = blob => { if (blob.type.includes('csv')) blob.text().then(s=>csv=s); return create(blob); };
       m.exportCsv(b); await new Promise(r=>setTimeout(r,50));
       URL.createObjectURL = create;
-      return {unknownGearBlocked,outputNumbers,legacyCommand,blockedBeforeFlash,newCommand,motorGains,
+      return {unknownGearBlocked,outputNumbers,legacyCommand,blockedBeforeFlash,newCommand,motorGains,velocityRange,
         degDisplay,changedUnitsNoMutation,powerBlocked,preview,started,renewed,switched,stopped,
         staleStopped,knobCenterConverted,reconnectSafe,rebootSafe,csv};
     });
@@ -125,10 +133,18 @@ catch { ({chromium} = require('C:/Users/admin/.cache/codex-runtimes/codex-primar
       'started','renewed','switched','stopped','staleStopped','knobCenterConverted','reconnectSafe','rebootSafe']) assert(results[key],key);
     assert.equal(results.outputNumbers.angle,360); assert.equal(results.outputNumbers.target,360);
     assert.equal(results.outputNumbers.speed,360); assert.equal(results.outputNumbers.single,0);
-    assert.equal(results.outputNumbers.displayed,'1.000000 圈'); assert.equal(results.degDisplay,'360.00 °');
+    // User-facing values are intentionally compact; charts keep the raw
+    // samples while the dashboard shows two decimals consistently.
+    assert.equal(results.outputNumbers.displayed,'1.00 圈'); assert.equal(results.degDisplay,'360.00 °');
     assert.equal(results.legacyCommand,'pos 1872 4095 30000');
     assert.equal(results.newCommand,'posout 36000 4095 30000');
-    assert.deepEqual(results.motorGains,[.0008,.016,12000,.1]);
+    assert(Math.abs(results.motorGains[0]-.0004)<1e-9 &&
+      Math.abs(results.motorGains[1]-.008)<1e-9 &&
+      // 36GP-555 UI values are output-shaft units; 5400 deg/s is 15 r/s
+      // and parameterToMotor applies the 5.2:1 ratio when sending.
+      Math.abs(results.motorGains[2]-5400)<1e-3 &&
+      Math.abs(results.motorGains[3]-.25)<1e-9);
+    assert.deepEqual(results.velocityRange,{min:-5400,max:5400});
     assert.equal(results.preview,-200);
     assert(results.csv.includes('output_multi_deg') && results.csv.includes('gear_ratio'));
     assert(commands.includes('velocity 187.2 4095 3000'));

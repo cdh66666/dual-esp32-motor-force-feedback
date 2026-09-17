@@ -14,7 +14,10 @@ const { chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-primary
   const baseUrl = process.env.MOTOR_DEBUG_URL || 'http://127.0.0.1:8766';
   const focus = process.env.MOTOR_DEBUG_FOCUS || '';
   const query = focus ? `/?focus=${encodeURIComponent(focus)}&v=smoke` : '/?v=smoke';
+  if (focus) await page.route('**/api/connect', route => route.fulfill({status:200,
+    contentType:'application/json', body:JSON.stringify({ok:true})}));
   await page.goto(baseUrl + query, {waitUntil: 'domcontentloaded'});
+  await page.click('#advancedToggle');
   await page.waitForSelector('.board');
   await page.waitForTimeout(1800);
   const result = await page.evaluate(() => ({
@@ -33,6 +36,7 @@ const { chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-primary
   await page.screenshot({path: 'D:/AI_Workspace/apps/dual-esp32-motor-force-feedback/evidence/ui-smoke.png', fullPage: true});
   console.log(JSON.stringify({...result, errors}, null, 2));
   await browser.close();
+  const checkedBoards = focus ? result.boards.filter(b => b.port.toUpperCase() === focus.toUpperCase()) : result.boards;
   const expectedBoards = focus ? 1 : 2;
-  if (errors.length || result.boards.length !== expectedBoards || result.boards.some(b => b.samples.startsWith('—'))) process.exitCode = 1;
+  if (errors.length || checkedBoards.length !== expectedBoards || checkedBoards.some(b => b.samples.startsWith('—'))) process.exitCode = 1;
 })();

@@ -1,14 +1,15 @@
 const fs=require('node:fs'),assert=require('node:assert/strict');
 const firmware=fs.readFileSync('firmware/src/main.cpp','utf8');
-const match=firmware.match(/const bool useModelEnvelope = ([\s\S]*?);/);
-assert(match);
-const choose=new Function('continuousCurrent','controlMode','CONTROL_POSITION','CONTROL_VELOCITY',`return ${match[1]};`);
-assert.equal(choose(true,1,1,2),false);
-assert.equal(choose(true,2,1,2),false);
-assert.equal(choose(true,3,1,2),true); // Haptic runs in current mode: unchanged.
-assert.equal(choose(true,4,1,2),true); // Knob path: unchanged.
-assert.equal(choose(false,3,1,2),false);
+assert(firmware.includes('const float lowerPwm = -pwmLimit;'));
+assert(firmware.includes('const float upperPwm = pwmLimit;'));
+assert(!firmware.includes('const bool useModelEnvelope'));
+assert(firmware.includes('interactionGuard.update('));
+assert(firmware.includes('if (protection.fault)'));
+assert(firmware.includes('motorProfileVoltageDutyLimit(cascadeBusVoltage)'));
+assert(firmware.includes('cascadeEmfVelocityDps = motor_control::emfVelocityEstimate('));
+assert(firmware.includes('currentTarget - cascadeMeasuredCurrentA'));
 assert(firmware.includes('15.0f * 360.0f * motorProfileGearRatio'));
+assert(firmware.includes('cascadePositionMaxAccelerationDps2 = 40000.0f;'));
 assert(firmware.includes('? interaction::operatingCurrentLimit(current) : min(cascadeVelocityMaxCurrentA, current)'));
 assert(firmware.includes('constrain(cascadeCurrentCommandA, -operatingLimit, operatingLimit)'));
-console.log('PASS position/velocity voltage authority; haptic/knob selection unchanged; current reference ceiling retained');
+console.log('PASS measured-current voltage authority in all modes; reference ceiling, measured guard and voltage rails retained');

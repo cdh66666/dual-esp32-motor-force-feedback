@@ -63,7 +63,9 @@ def main() -> int:
         time.sleep(1.15)
         # Allow at most one read already in flight when close() occurred.
         assert first.read_calls <= first_reads_after_disconnect + 1
-        assert second.writes[:3] == ["stream 100", "businfo", "model"]
+        # Every fresh CDC handle is fenced with an idempotent STOP before
+        # telemetry probes so a stale target cannot resume across reconnect.
+        assert second.writes[:4] == ["stop", "stream 100", "businfo", "model"]
         assert "wake" not in second.writes, "monitor must not mutate actuator state"
         print({
             "old_reader_stopped": True,
