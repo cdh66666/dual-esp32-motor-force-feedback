@@ -24,12 +24,14 @@ from serial.tools import list_ports
 try:
     from chain_gateway import ChainGateway, RemoteRejected
     from device_topology import DeviceTopology
+    import recorder
 except ModuleNotFoundError:
     _WEB_DIR = str(Path(__file__).resolve().parent)
     if _WEB_DIR not in sys.path:
         sys.path.insert(0, _WEB_DIR)
     from chain_gateway import ChainGateway, RemoteRejected
     from device_topology import DeviceTopology
+    import recorder
 
 
 ROOT = Path(__file__).resolve().parent
@@ -596,8 +598,15 @@ class PortSession:
 
     def payload_since(self, since):
         with self.lock:
+            # A negative `since` means "I only want the cursor".  Callers that
+            # poll the log to measure something (rather than to display it) must
+            # be able to learn where the log ends WITHOUT dragging the entire
+            # buffer across USB; that buffer grows all session, so a poller that
+            # starts from 0 gets slower and slower until it stalls the test.
+            if since < 0:
+                return {"session_id": self.session_id, "logs": [], "seq": self.seq}
             if since > self.seq: since = 0
-            return {"session_id": self.session_id,
+            return {"session_id": self.session_id, "seq": self.seq,
                     "logs": [x for x in self.logs if x['seq'] > since and x['session_id'] == self.session_id]}
 
 
@@ -724,11 +733,22 @@ def validate_command(command: str, _armed: bool = True):
                 0 <= damping <= 10 and spacing <= width <= 720):
                 return "knob config " + " ".join(f"{v:g}" for v in (effect, spacing, peak, damping, width))
         raise ValueError("旋钮参数无效：模式0..3，输出轴间距2..90°，强度0..600 mA，阻尼0..10 mA/(°/s)，范围间距..720°")
-    safe = {"help", "status", "diag", "encoder", "encreset", "rawadc", "model", "motorprofile status", "businfo", "wake", "recover", "sleep", "stop", "led on", "led off", "led auto", "decay slow", "decay fast", "pospid on", "pospid off", "pospid status", "cascade status", "sync off", "sync stop", "sync disarm", "sync status"}
+    safe = {"help", "status", "diag", "encoder", "encreset", "rawadc", "model", "motorprofile status", "businfo", "wake", "recover", "sleep", "stop", "led on", "led off", "led auto", "decay slow", "decay fast", "pospid on", "pospid off", "pospid status", "cascade status", "sync off", "sync stop", "sync disarm", "sync status",
+            # Firmware-side diagnostics.  The whitelist silently swallowed these
+            # once, which looked exactly like "the firmware ignored the command".
+            "cost", "gapclear"}
     if command in safe:
         return command
     if command in {"cascade hold on", "cascade hold off"}:
         return command
+    # Re-time the encoder I2C bus on a live board so the transaction-time vs
+    # bit-error trade can be A/B tested without a reflash.
+    i2c_clock = re.fullmatch(r"i2cclk\s+(\d{6,7})", command)
+    if i2c_clock:
+        hz = int(i2c_clock.group(1))
+        if not 100000 <= hz <= 1000000:
+            raise ValueError("编码器 I2C 时钟范围：100000..1000000 Hz")
+        return f"i2cclk {hz}"
     if command == 'trace dump': return command
     if re.fullmatch(r'trace arm (?:[1-9][0-9]{1,2}|10[01][0-9]|102[0-4])', command):
         return command
@@ -888,9 +908,11 @@ def validate_command(command: str, _armed: bool = True):
         brake_slew = values[5] if len(values) >= 6 else 1.0
         if not all(math.isfinite(x) for x in values) or not (
             0 <= kp <= 1 and 0 <= ki <= 1 and 0.05 <= max_current <= 7 and 0 <= friction <= 5
-            and 0.1 <= current_slew <= 100 and 1 <= brake_slew <= 50
+            and 0.1 <= current_slew <= 20000 and 1 <= brake_slew <= 50
         ):
-            raise ValueError("速度环范围：Kp/Ki 0..1，最大电流 0.05..7 A，摩擦前馈 0..5 A")
+            raise ValueError(
+                "速度环范围：Kp/Ki 0..1，最大电流 0.05..7 A，摩擦前馈 0..5 A，"
+                "电流斜率 0.1..20000 A/s（>=5000 表示直接给，不做缓启动）")
         # Omitted parameters belong to the board's active motor profile.
         return "cascade velocity " + " ".join(f"{x:g}" for x in values)
     cascade_position = re.fullmatch(
@@ -1117,6 +1139,50 @@ class Handler(BaseHTTPRequestHandler):
             since = int(query.get("since", ["0"])[0])
             session = get_session(port)
             return self.send_json(session.payload_since(since))
+        if parsed.path == "/api/record/status":
+            return self.send_json(recorder.status())
+        if parsed.path == "/api/record/clip":
+            query = parse_qs(parsed.query)
+            path = recorder.clip_path(query.get("name", [""])[0])
+            if path is None:
+                return self.send_error(404)
+            size = path.stat().st_size
+            total = size
+            # Honour Range so the <video> element can seek without pulling the
+            # whole clip again.
+            start, end = 0, size - 1
+            rng = self.headers.get("Range")
+            if rng and rng.startswith("bytes="):
+                first, _, last = rng[len("bytes="):].partition("-")
+                if first:
+                    start = int(first)
+                if last:
+                    end = min(int(last), size - 1)
+                if start > end or start >= size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{total}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+            length = end - start + 1
+            self.send_response(206 if (rng and rng.startswith("bytes=")) else 200)
+            self.send_header("Content-Type", "video/webm")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            if rng and rng.startswith("bytes="):
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            with path.open("rb") as handle:
+                handle.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = handle.read(min(262144, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            return
         if parsed.path == "/api/events":
             query = parse_qs(parsed.query)
             session = get_session(query.get("port", [""])[0])
@@ -1166,6 +1232,18 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             body = self.read_json()
+            # Acceptance recording, driven from the 录制 button on the page.
+            # These are the only endpoints here that outlive their request: the
+            # take runs for tens of seconds while the handler has long returned.
+            if parsed.path == '/api/record/start':
+                live = [item['port'] for item in port_info() if item.get('active')]
+                return self.send_json(recorder.start(
+                    seconds=body.get('seconds', 15),
+                    suite=str(body.get('suite') or 'manual'),
+                    ports=live or body.get('ports'),
+                ))
+            if parsed.path == '/api/record/stop':
+                return self.send_json(recorder.stop())
             port = str(body.get("port", "")).upper()
             if parsed.path == '/api/chain/assign-id':
                 live=[]

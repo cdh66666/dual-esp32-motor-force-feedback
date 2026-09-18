@@ -444,7 +444,8 @@ function boardHtml(board) {
     slider('positionMinVelocity', '输出轴脱困最小速度', 0, 60000, 100, 0),
     slider('positionDeadband', '输出轴到位死区', 0.1, 10, 0.1, 3),
     slider('positionLowSpeedCurrent', '低速前进电流下限 A', 0, 7, 0.05, 2),
-    '</div><label><input type="checkbox" data-hold> 到位后持续保持（STOP 可停止）</label>',
+    '</div><label title="关闭（默认）：接近目标就卸力滑行，停得干脆，代价是落地可能差 1~3°。&#10;打开：到位后继续闭环修正，更贴目标，但会和减速箱静摩擦较劲，容易在目标附近来回抖（实测尾段摆幅可达 5.8°）。">' +
+    '<input type="checkbox" data-hold> 到位后持续保持（默认关 · 关着更稳，开着更贴）</label>',
     '<div class="row"><button data-act="holdZero" class="primary">保持输出轴零位</button>',
     '<button data-act="positionTest">输出轴 1 圈往返测试</button></div>',
     '<p class="hint">滑动目标即发送。页面全部角度和速度按减速比换算为输出轴坐标；后轴编码器不能测出减速箱齿隙。已调好的板端三环算法和参数保持不变。</p></section></div>',
@@ -607,7 +608,10 @@ function applyMotorProfileUi(board, profile, gear = profile === '36gp555' ? 5.2 
   setSliderRange(board, 'velocityKi', 0, .02, .00001, .001);
   setSliderRange(board, 'positionDeadband', .05, 10, .05, .1);
   board.appliedCommands = {};
-  board.positionHold = profile === '36gp555';
+  // Do not assume hold is on for a profile.  The board is the source of truth:
+  // its persisted value arrives in CONTROL_STATS and is copied into this
+  // checkbox below, and a profile change must not silently overwrite it.
+  board.positionHold = false;
   board.positionAcceleration = profile === '36gp555' ? 40000 : profile === '25ga370' ? 30000 : 100000;
   $('[data-hold]', board.root).checked = board.positionHold;
   const select = $('[data-profile]', board.root);
@@ -639,7 +643,12 @@ function applyMotorProfileUi(board, profile, gear = profile === '36gp555' ? 5.2 
     setSlider(board, 'positionKi', 0);
     setSlider(board, 'positionKd', 0.15);
     setSlider(board, 'positionDeadband', 0.25);
-    board.velocityCurrentSlew = 80;
+    // Direct current (no soft start / soft release).  The 80 A/s ramp only
+    // existed to survive a weak supply; with the current supply it made the
+    // velocity loop lag its own request and limit-cycle (+/-1 A on the scope
+    // while accelerating).  Keep this in step with the firmware profile
+    // default, otherwise connecting re-imposes the ramp on a fresh board.
+    board.velocityCurrentSlew = 20000;
     board.velocityBrakeSlew = 1;
     setSlider(board, 'openPwm', 205);
     $('[data-profile-status]', board.root).textContent =
@@ -716,12 +725,17 @@ function bindBoard(board) {
   board.root.querySelectorAll('[data-window]').forEach(select => {
     select.addEventListener('change', () => setTargetWindow(board, select.dataset.window, Number(select.value)));
   });
-  $('[data-hold]', board.root).addEventListener('change', event => {
+  $('[data-hold]', board.root).addEventListener('change', async event => {
     board.positionHold = event.target.checked;
-    board.configApplied = false;
-    board.configDirty = true;
-    board.configGeneration += 1;
-    scheduleConfig(board);
+    // Own switch, sent on demand: it is not part of the auto-applied config
+    // batch, so nothing replays it on connect and clobbers the board's value.
+    try {
+      await send(board.port, 'cascade hold ' + (board.positionHold ? 'on' : 'off'));
+    } catch (error) {
+      board.positionHold = !board.positionHold;
+      event.target.checked = board.positionHold;
+      throw error;
+    }
   });
   board.root.querySelectorAll('[data-chart]').forEach(section => {
     board.canvases[section.dataset.chart] = $('canvas', section);
@@ -810,6 +824,20 @@ function queueMotionFlush(board) {
   }, Math.max(0, 25 - (Date.now() - board.lastMotionFlushAt)));
 }
 
+// The two current-ramp fields of `cascade velocity` belong to the board's motor
+// profile, not to the browser: no slider here can edit them, and the firmware
+// profile already carries the commissioned value (the 36GP-555 runs direct
+// drive, i.e. >= 5000 A/s = "no soft start").  Echoing them back is a no-op on
+// the board, but it is not free everywhere else -- a backend whose validator
+// still caps the ramp at 100 A/s rejects the whole command, which silently
+// takes the velocity gains down with it.  Send them only when the profile asks
+// for a ramp the board would not already be holding.
+function velocityRampTail(board) {
+  const slew = Number(board.velocityCurrentSlew);
+  if (!Number.isFinite(slew) || slew >= 5000) return '';
+  return ' ' + (slew || 30) + ' ' + (board.velocityBrakeSlew || 30);
+}
+
 async function applyCascade(board, notify = true) {
   if (!board.active) return;
   if (!board.motorProfile) throw new Error('尚未读取板端电机档案，未下发控制参数');
@@ -824,15 +852,16 @@ async function applyCascade(board, notify = true) {
       valueOf(board, 'currentKi') + ' ' + valueOf(board, 'currentMaxPwm'),
     'cascade velocity ' + parameterToMotor(board, 'velocityKp') + ' ' +
       parameterToMotor(board, 'velocityKi') + ' ' + valueOf(board, 'velocityMaxCurrent') + ' ' +
-      valueOf(board, 'velocityFriction') + ' ' +
-      (board.velocityCurrentSlew || 30) + ' ' +
-      (board.velocityBrakeSlew || 30),
+      valueOf(board, 'velocityFriction') + velocityRampTail(board),
     'cascade position ' + valueOf(board, 'positionKp') + ' ' +
       valueOf(board, 'positionKi') + ' ' + valueOf(board, 'positionKd') + ' ' +
       parameterToMotor(board, 'positionMaxVelocity') + ' ' + parameterToMotor(board, 'positionDeadband') + ' ' +
       parameterToMotor(board, 'positionMinVelocity') + ' ' + board.positionAcceleration + ' 1',
     'cascade low_speed_current ' + valueOf(board, 'positionLowSpeedCurrent'),
-    'cascade hold ' + (board.positionHold ? 'on' : 'off'),
+    // "cascade hold" is deliberately NOT part of the auto-applied batch.  It
+    // is a behaviour switch owned by the board: replaying a browser-side
+    // default here used to flip a freshly powered rig back into the mode that
+    // hunts around the target.  The checkbox sends it directly on change.
   ];
   const transaction = (async () => {
     for (const command of commands) {
@@ -1728,6 +1757,7 @@ async function pollLogs(board) {
   board.polling = true;
   try {
     const result = await api('logs?port=' + encodeURIComponent(board.port) + '&since=' + board.seq);
+    board.pollFailures = 0;
     ingestLogs(board, result);
     if(result.gateway){
       const d=result.gateway,f=d.fields;
@@ -1738,7 +1768,14 @@ async function pollLogs(board) {
       board.latest=s;board.driverReady=s.awake===1;board.samples.push(s);while(board.samples.length>500)board.samples.shift();board.lastTelemetryAt=Date.now();board.dirty=true;
     }
   } catch (_) {
-    board.active = false;
+    // One failed read is not evidence that the handle is gone. The backend
+    // answers 500 by design while a port re-enumerates, and treating that as
+    // "offline" flipped the board inactive on every replug: coming back then
+    // re-ingested the retained history and re-applied the whole cascade batch,
+    // which is exactly the stutter-and-drop pattern seen after swapping a USB
+    // cable. /api/ports remains the authority on presence.
+    board.pollFailures = (board.pollFailures || 0) + 1;
+    if (board.pollFailures >= 8) board.active = false;
   } finally {
     board.polling = false;
   }
@@ -2890,7 +2927,7 @@ async function runAutoTune(identificationOnly = false) {
       const originalPosition=`cascade position ${valueOf(b,'positionKp')} ${valueOf(b,'positionKi')} ${valueOf(b,'positionKd')} ${parameterToMotor(b,'positionMaxVelocity')} ${parameterToMotor(b,'positionDeadband')} ${parameterToMotor(b,'positionMinVelocity')} ${b.positionAcceleration} 1`;
       const originalHold=b.positionHold;
       const velocityP=Number(parameterToMotor(b,'velocityKp')),velocityI=Number(parameterToMotor(b,'velocityKi'));
-      const originalVelocity=`cascade velocity ${velocityP} ${velocityI} ${valueOf(b,'velocityMaxCurrent')} ${valueOf(b,'velocityFriction')} ${b.velocityCurrentSlew||30} ${b.velocityBrakeSlew||30}`;
+      const originalVelocity=`cascade velocity ${velocityP} ${velocityI} ${valueOf(b,'velocityMaxCurrent')} ${valueOf(b,'velocityFriction')}${velocityRampTail(b)}`;
       const report={port:b.port,hwid:b.hwid,date:new Date().toISOString(),originalConfiguration:configuration,originalCompensation,scope:'±5° 输出轴；0.1°容差；本次负载；非PWM纹波测量',currentTrials:[],positionTrials:[],passed:false};
       autoTune.reports.push(report);
       try { localStorage.setItem('motor-auto-tune-pending',JSON.stringify({port:b.port,hwid:b.hwid,originalCurrent,originalPosition,originalVelocity,originalAssist,originalHold,originalCompensation,date:report.date})); } catch {}
@@ -2904,7 +2941,7 @@ async function runAutoTune(identificationOnly = false) {
         if(identificationOnly) {
           report.identification=[];
           // A continuous sequence rather than reset-to-STOP between speeds.
-          await tx(b,`cascade velocity ${velocityP} ${velocityI} ${Math.min(.6,valueOf(b,'velocityMaxCurrent'))} ${valueOf(b,'velocityFriction')} ${b.velocityCurrentSlew||30} ${b.velocityBrakeSlew||30}`);
+          await tx(b,`cascade velocity ${velocityP} ${velocityI} ${Math.min(.6,valueOf(b,'velocityMaxCurrent'))} ${valueOf(b,'velocityFriction')}${velocityRampTail(b)}`);
           const speeds=[5,15,30,15,5,-5,-15,-30,-15,-5];
           for(const [stage,speed] of speeds.entries()) {
             $('#autoState').textContent=`${b.port} · ${speed>0?'正转':'反转'} ${Math.abs(speed)}°/s · ${stage+1}/${speeds.length}`;
@@ -3218,12 +3255,23 @@ if(wifiTransport){
   $('#forceState').textContent='同版界面；热点力反馈接口尚未接通，未启动。';
   $('#quickState').textContent='拖动更新目标；热点指令1秒有效，不自动续发。PWM/校准/设置尚未接通。';
 }
-await refreshPorts();
+// This await sits at module scope, so a rejected promise here aborted the rest
+// of the module -- no interval was ever registered and the page sat on
+// "正在检测设备…" forever, with no polling and no way back without a reload.
+// The backend answers 500 by design while a port re-enumerates, which is
+// exactly when the page is likely to be opened again.
+try { await refreshPorts(); }
+catch (error) { console.warn('initial refreshPorts failed; the 1 Hz retry will keep trying', error); }
 setInterval(refreshPorts, 1000);
 setInterval(() => boards.forEach(pollLogs), 25);
 // Haptic forces run on the board. This is only a low-rate safety lease.
 setInterval(() => boards.forEach(board => renewMotion(board).catch(error => toast(error.message, true))), 250);
 function stopHiddenKnobs() {
+  // 录制进程会加载这个页面来抓曲线那一半（带 nocam 参数）。它关窗时必须什么都
+  // 不下发：操作者此刻手还在旋钮上，任何一条 stop 都会把他正在测的力反馈掐掉。
+  // 按现有逻辑这个页面本来就不该触发（没人在这里启动力反馈，也没有活动中的运动），
+  // 但代价太不对称，所以直接按"观察页"拦掉。
+  if (window.__acceptanceRecorderPage) return;
   // Leaving the page must revoke every actuator lease, not only the legacy
   // knob lease.  A hidden tab can otherwise keep renewing a position/velocity
   // target for up to its firmware timeout and resurrect it after a USB
@@ -3263,3 +3311,346 @@ function stopHiddenKnobs() {
 document.addEventListener('visibilitychange', () => { if (document.hidden) stopHiddenKnobs(); });
 window.addEventListener('pagehide', stopHiddenKnobs);
 requestAnimationFrame(animationFrame);
+
+/* ---------------------------------------------------------------------------
+ * 实物相机预览 + 验收录制
+ *
+ * 让实物画面和调试台曲线出现在同一屏：以前要开两个页面才能一边看曲线一边看电机，
+ * 手在拧旋钮的时候根本顾不上切窗口。这个浮窗可以拖动、缩放、收起。
+ *
+ * 「录制 15 秒」不在这里抓帧。它把活交给后台的 dualrec.cjs：那个进程会另开一个
+ * 离屏 Chromium，把相机画面和这个页面的曲线按同一个时钟烧成上下两半，最后合成
+ * 一段 webm。本页只负责倒计时和把结果放出来。
+ *
+ * 一个必须处理的冲突：USB 摄像头同一时刻只服务一个客户端。录制进程要用它，
+ * 本页的预览也得用它，所以点录制时先把相机的轨道放掉，录完再拿回来——否则录出来
+ * 的上半屏会是黑的，而这正是最容易被忽略的失败方式。
+ * ------------------------------------------------------------------------- */
+(() => {
+  const panel = $('#camPanel');
+  if (!panel) return;
+  const showBtn = $('#camShow');
+  // 验收录制会加载同一个页面来抓曲线那一半，而它已经通过 mix.html 占用了相机。
+  // 让被录的页面再开一路流会互相抢设备，所以带 nocam 参数时这个浮窗整体不装。
+  if (new URLSearchParams(location.search).has('nocam')) {
+    // 标记成观察页：见 stopHiddenKnobs —— 这一页关窗时不许向两板下发任何指令。
+    window.__acceptanceRecorderPage = true;
+    panel.remove(); showBtn?.remove(); return;
+  }
+
+  const POS_KEY = 'camPanel.pos';
+  const S = { stream: null, deviceId: '', recording: false, timer: null, live: false, liveUrl: '' };
+
+  const setState = (text, cls = '') => {
+    const el = $('#recState');
+    if (!el) return;
+    el.textContent = text;
+    el.className = cls;
+  };
+
+  // --- 浮窗拖动 / 收起 ---------------------------------------------------
+  function applyPos(pos) {
+    if (!pos) return;
+    panel.style.left = pos.x + 'px';
+    panel.style.top = pos.y + 'px';
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
+    if (pos.w) panel.style.width = pos.w + 'px';
+    if (pos.h) panel.style.height = pos.h + 'px';
+  }
+  try { applyPos(JSON.parse(localStorage.getItem(POS_KEY) || 'null')); } catch (e) {}
+
+  (() => {
+    const handle = $('#camDrag');
+    let drag = null;
+    handle?.addEventListener('pointerdown', event => {
+      if (event.target.closest('select,button')) return;   // 别抢控件的点击
+      const box = panel.getBoundingClientRect();
+      drag = { dx: event.clientX - box.left, dy: event.clientY - box.top };
+      handle.setPointerCapture(event.pointerId);
+    });
+    handle?.addEventListener('pointermove', event => {
+      if (!drag) return;
+      const w = panel.offsetWidth, h = panel.offsetHeight;
+      const x = Math.min(Math.max(0, event.clientX - drag.dx), innerWidth - w);
+      const y = Math.min(Math.max(0, event.clientY - drag.dy), innerHeight - 40);
+      panel.style.left = x + 'px'; panel.style.top = y + 'px';
+      panel.style.right = 'auto'; panel.style.bottom = 'auto';
+    });
+    handle?.addEventListener('pointerup', () => {
+      if (!drag) return;
+      drag = null;
+      const box = panel.getBoundingClientRect();
+      try {
+        localStorage.setItem(POS_KEY, JSON.stringify(
+          { x: Math.round(box.left), y: Math.round(box.top),
+            w: Math.round(box.width), h: Math.round(box.height) }));
+      } catch (e) {}
+    });
+  })();
+
+  $('#camHide')?.addEventListener('click', () => { panel.hidden = true; showBtn.hidden = false; });
+  showBtn?.addEventListener('click', () => { panel.hidden = false; showBtn.hidden = true; });
+
+  // --- 相机 -------------------------------------------------------------
+  async function fillDevices(preferred) {
+    let list = [];
+    try {
+      list = (await navigator.mediaDevices.enumerateDevices())
+        .filter(d => d.kind === 'videoinput');
+    } catch (e) { /* 没有 mediaDevices 时下面会给出可读的失败原因 */ }
+    const sel = $('#camDevice');
+    if (!sel) return list;
+    const previous = sel.value;
+    sel.textContent = '';
+    list.forEach((d, i) => {
+      const option = document.createElement('option');
+      option.value = d.deviceId;
+      // 没授过权时 label 是空的，这时只能靠序号区分。
+      option.textContent = d.label || `相机 ${i + 1}`;
+      sel.appendChild(option);
+    });
+    // 与录制进程一致：优先选 2K 那台整机相机。
+    const rig = list.find(d => /2k/i.test(d.label || ''));
+    sel.value = preferred || rig?.deviceId || previous || list[0]?.deviceId || '';
+    return list;
+  }
+
+  function stopCam() {
+    if (S.stream) {
+      S.stream.getTracks().forEach(track => track.stop());
+      S.stream = null;
+    }
+    const video = $('#camPreview');
+    if (video) video.srcObject = null;
+    const on = $('#camOn'), off = $('#camOff');
+    if (on) on.hidden = false;
+    if (off) off.hidden = true;
+  }
+
+  async function startCam() {
+    const sel = $('#camDevice');
+    const wanted = sel?.value || '';
+    stopCam();
+    try {
+      const video = wanted
+        ? { deviceId: { exact: wanted }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+        : { width: { ideal: 1920 }, height: { ideal: 1080 } };
+      S.stream = await navigator.mediaDevices.getUserMedia({ video });
+      const el = $('#camPreview');
+      el.srcObject = S.stream;
+      await el.play().catch(() => {});
+      S.deviceId = wanted || S.stream.getVideoTracks()[0].getSettings().deviceId || '';
+      $('#camOn').hidden = true;
+      $('#camOff').hidden = false;
+      // 授权之后 label 才有值，这时刷新一次列表，用户才看得见是选了哪台。
+      if (!sel.options[sel.selectedIndex]?.textContent?.trim() || /^相机 \d+$/.test(sel.options[sel.selectedIndex]?.textContent || '')) {
+        await fillDevices(S.deviceId);
+      }
+      setState('相机已开启。做手动测试时点「录制 15 秒」——录制会先接管相机，录完自动还回来。', 'ok');
+    } catch (error) {
+      setState('打不开相机：' + (error?.message || error)
+        + '。浏览器第一次会询问摄像头权限，要点「允许」；若之前点过拒绝，'
+        + '请在地址栏左侧的图标里改回允许再刷新。', 'bad');
+    }
+  }
+
+  $('#camOn')?.addEventListener('click', startCam);
+  $('#camOff')?.addEventListener('click', stopCam);
+  $('#camDevice')?.addEventListener('change', () => startCam());
+
+  // --- 录制 -------------------------------------------------------------
+  function releaseCameraForRecorder() {
+    stopCam();
+  }
+
+  // --- 录制期间的实时画面 ------------------------------------------------
+  // 一台 USB 相机只服务一个客户端，录制时那个客户端是录制进程（它的 mix.html
+  // 拿着相机），所以这一段里本机预览必然是黑的。录制进程会把合成好的帧通过
+  // /live 以 MJPEG 推出来，这里用 <img> 直接显示——操作者就能一边做力反馈测试
+  // 一边看着实物，而不是对着黑框拧旋钮。
+  function showLive(url) {
+    const img = $('#recLive');
+    if (!img) return;
+    if (S.liveUrl !== url) {
+      S.liveUrl = url;
+      // 加时间戳只是为了让重新开始的一段不复用上一段的连接。
+      img.src = url + '?t=' + Date.now();
+      img.hidden = false;
+      const video = $('#camPreview');
+      if (video) video.hidden = true;   // 相机已经被录制进程拿走了
+      S.live = true;
+    }
+    const badge = $('#recBadge');
+    if (badge) badge.hidden = false;
+    const toggle = $('#recView');
+    if (toggle) toggle.hidden = false;
+  }
+
+  function hideLive() {
+    if (!S.live) return;
+    S.live = false;
+    S.liveUrl = '';
+    const img = $('#recLive');
+    if (img) { img.removeAttribute('src'); img.hidden = true; }
+    const video = $('#camPreview');
+    if (video) video.hidden = false;
+    const badge = $('#recBadge');
+    if (badge) badge.hidden = true;
+    const toggle = $('#recView');
+    if (toggle) toggle.hidden = true;
+    const hint = $('#liveHint');
+    if (hint) hint.hidden = true;
+  }
+
+  $('#recView')?.addEventListener('click', () => {
+    const view = $('#camView');
+    if (!view) return;
+    const mix = view.classList.toggle('mode-mix');
+    view.classList.toggle('mode-cam', !mix);
+    $('#recView').textContent = mix ? '看实物画面' : '看合成图';
+  });
+
+  $('#recLive')?.addEventListener('error', () => {
+    // 拿不到实时画面不影响录制本身，所以只提示，不把它当失败。
+    if (!S.live) return;
+    const hint = $('#liveHint');
+    if (!hint) return;
+    hint.textContent = '拿不到录制进程的实时画面（录制本身照常进行）。';
+    hint.hidden = false;
+  });
+
+  async function poll() {
+    if (!S.recording) return;
+    let status = null;
+    try {
+      status = await (await fetch('/api/record/status')).json();
+    } catch (error) {
+      S.timer = setTimeout(poll, 1500);
+      return;
+    }
+    const active = status?.active;
+    if (!active) { S.timer = setTimeout(poll, 1500); return; }
+
+    // 只有 phase=done 才算录完。clip.webm 在 ffmpeg 开始编码的那一刻就被创建了，
+    // 所以"文件已存在"会提前几秒成立——照它收尾就会播出一段被截断的视频。
+    if (!active.running && active.phase === 'error') {
+      finishTake(active, '录制失败：' + (active.error || '录制进程提前退出'));
+      return;
+    }
+    if (!active.running && active.phase === 'done') { finishTake(active, ''); return; }
+
+    // 录制进程活着时用它的实时画面（相机在它手上）；它一把相机放开（编码阶段）
+    // 就换回本机预览，不用等到整段录完才有画面。
+    if (active.liveUrl) {
+      showLive(active.liveUrl);
+    } else if (S.live) {
+      hideLive();
+      startCam();
+    }
+
+    if (active.phase === 'recording' && typeof active.remainingS === 'number') {
+      setState(`正在录制：还剩 ${active.remainingS.toFixed(0)} 秒`
+        + `（已录 ${active.frames ?? 0} 帧，${active.fps ?? 15} fps）。现在可以做力反馈测试。`, 'rec');
+    } else if (active.phase === 'encoding') {
+      const pct = typeof active.encodePct === 'number' ? ` ${active.encodePct}%` : '…';
+      setState(`正在编码视频${pct}（相机已经还回来了，画面是实时的）。`, 'rec');
+    } else {
+      const label = {
+        starting: '正在打开录制进程（要另起一个离屏浏览器）…',
+        boards: '录制进程正在等两板在线…',
+      }[active.phase] || ('进行中：' + active.phase);
+      setState(label, 'rec');
+    }
+    S.timer = setTimeout(poll, 700);
+  }
+
+  function finishTake(active, problem) {
+    S.recording = false;
+    if (S.timer) clearTimeout(S.timer);
+    hideLive();
+    $('#recStart').disabled = false;
+    $('#recStop').hidden = true;
+    startCam();     // 把相机还回来
+
+    if (problem) { setState(problem, 'bad'); return; }
+    if (!active.clipUrl) {
+      setState('录制结束了，但没有生成视频文件。', 'bad');
+      return;
+    }
+    const video = $('#recClip');
+    video.src = active.clipUrl + '&t=' + Date.now();
+    const link = $('#recLink');
+    link.href = active.clipUrl;
+    link.download = (active.name || 'clip') + '.webm';
+    $('#recResult').hidden = false;
+    $('#recInfo').textContent = `${active.durationS ?? '?'} 秒 · ${active.frames ?? '?'} 帧`
+      + ` · ${active.fps ? Number(active.fps).toFixed(1) : '?'} fps`;
+
+    // 板端日志环只有 2000 条、约 20 秒滚一圈，所以这段记录只在短片里值得看。
+    const events = active.verdict?.events;
+    $('#recEvents').textContent = events?.length
+      ? events.map(e => `${e.port}：双板力反馈启用 ${e.forceArmed} 次 ·`
+          + ` 力反馈旋钮启用 ${e.knobStarts} 次 · 板端记录 ${e.haptic} 条`).join('\n')
+      : '没有从板端日志里读到力反馈事件。如果这段确实做过力反馈，多半是日志环'
+        + '（约 20 秒滚一圈）已经把那几条冲掉了——把录制时长缩短，或者把「启动力反馈」'
+        + '这一步放到录制开始之后再做。';
+    setState('录制完成。视频在下面，可以直接播放或下载。'
+      // 走到这条分支说明产物已经齐了、只是录制进程自己在收尾时卡住了，如实说一句。
+      + (active.recovered ? '（录制进程收尾时卡住，已按已生成的视频收尾。）' : ''), 'ok');
+  }
+
+  async function startTake() {
+    if (S.recording) return;
+    const seconds = Number($('#recSeconds')?.value) || 15;
+    releaseCameraForRecorder();
+    $('#recStart').disabled = true;
+    $('#recResult').hidden = true;
+    setState('正在准备录制（打开录制进程、等待两板在线）…', 'rec');
+    try {
+      const response = await fetch('/api/record/start', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ seconds, suite: 'manual' }),
+      });
+      const result = await response.json();
+      if (!result.ok) throw new Error(result.error || '录制进程启动失败');
+      S.recording = true;
+      $('#recStop').hidden = false;
+      poll();
+    } catch (error) {
+      setState('无法开始录制：' + (error?.message || error), 'bad');
+      $('#recStart').disabled = false;
+      startCam();
+    }
+  }
+
+  $('#recStart')?.addEventListener('click', startTake);
+  $('#recStop')?.addEventListener('click', async () => {
+    $('#recStop').disabled = true;
+    try {
+      const result = await (await fetch('/api/record/stop', { method: 'POST' })).json();
+      setState(result.ok ? '已请求收尾，等它编码完…' : ('无法结束：' + (result.error || '')),
+               result.ok ? 'rec' : 'bad');
+    } finally {
+      setTimeout(() => { $('#recStop').disabled = false; }, 1500);
+    }
+  });
+
+  // 没录过的话先看一眼能力：缺工具链时按钮直接说明缺什么，而不是点了没反应。
+  (async () => {
+    try {
+      const status = await (await fetch('/api/record/status')).json();
+      if (!status.available) {
+        $('#recStart').disabled = true;
+        setState(status.reason || '录制功能不可用', 'bad');
+        return;
+      }
+    } catch (e) { /* 老服务端没有这个接口时，按钮仍会给出明确报错 */ }
+    await fillDevices();
+    // 已经授过权就自动开预览；没授过就等用户点按钮，避免一进页面就弹权限框。
+    let perm = null;
+    try { perm = await navigator.permissions?.query({ name: 'camera' }); } catch (e) {}
+    if (perm?.state === 'granted') startCam();
+    else setState('点「开启相机」授权后，实物画面和曲线就能同屏对照了。', '');
+  })();
+})();

@@ -20,7 +20,11 @@ try {
         'tests/usb_identity_contract.cjs',
         'tests/connect_recovery_contract.cjs',
         'tests/force_lifecycle_contract_test.cjs',
-        'tests/interaction_ui_test.cjs'
+        'tests/interaction_ui_test.cjs',
+        # Serves a fake dashboard on 18766 and asserts the parse/readback
+        # contract; no hardware.  It was missing from this list and silently
+        # rotted against the hold-flag rework until it was added back.
+        'tests/dashboard_data_contract_test.js'
     )
     foreach ($check in $checks) {
         & $Node $check

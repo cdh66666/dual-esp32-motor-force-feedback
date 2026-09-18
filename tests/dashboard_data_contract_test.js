@@ -17,6 +17,19 @@ catch { ({ chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-prim
     return route.fulfill({contentType:'application/json',body:JSON.stringify(result)});
   });
   await page.goto('http://127.0.0.1:18766/?test=data-contract');
+  // The dashboard carries a fixed, draggable camera/recording window in the
+  // bottom-right corner, and the collapsed-state button that reopens it sits in
+  // the same corner. Both float above the page, so anything that happens to
+  // render underneath them -- #advancedToggle is a full-width block -- is
+  // covered by the overlay and the click lands on the overlay instead. The
+  // panel has nothing to do with the parse/readback contract asserted here, so
+  // take it out of the layout rather than teaching every click to dodge it.
+  await page.evaluate(() => {
+    for (const id of ['camPanel', 'camShow']) {
+      const el = document.getElementById(id);
+      if (el) el.style.display = 'none';
+    }
+  });
   await page.click('#advancedToggle');
   await page.waitForSelector('[data-port="FAKE"]');
   const results = await page.evaluate(async () => {
@@ -55,9 +68,17 @@ catch { ({ chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-prim
     module.parseLine(board,s(100));
     module.parseLine(board,'MODEL fw=test');
     const validOnly = board.samples.length === before && board.lastTelemetryAt === timestamp;
+    // `hold` is a board-owned flag now: applyMotorProfileUi() no longer assumes
+    // it from the profile (it used to pin 36gp555 to "on"), so the contract has
+    // to be stated for both states instead of inheriting one from the profile.
+    board.positionHold = true;
     board.activeMotion={mode:'position',value:720};
     module.parseLine(board,s(110));
     const holdSurvivesSettled = board.activeMotion?.mode === 'position';
+    board.positionHold = false;
+    board.activeMotion={mode:'position',value:720};
+    module.parseLine(board,s(120));
+    const holdOffEndsSettled = board.activeMotion === null;
     board.seq=10000; board.sessionId='old';
     module.ingestLogs(board,{session_id:'new',logs:[
       {seq:1,direction:'rx',text:'MOTOR_PROFILE id=36gp555-24v-1538rpm gear=5.2 voltage_pwm_limit=4095/4095'},
@@ -91,12 +112,13 @@ catch { ({ chromium } = require('C:/Users/admin/.cache/codex-runtimes/codex-prim
       {seq:3,direction:'rx',text:'CASCADE fault nFAULT=0'}
     ]});
     const liveFaultVisible = !document.querySelector('#errorModal').hidden;
-    return {validOnly,holdSurvivesSettled,epochResets,gainsReadBack,knobReadback,peerCurve,angle,rawDegrees:720,
+    return {validOnly,holdSurvivesSettled,holdOffEndsSettled,epochResets,gainsReadBack,knobReadback,peerCurve,angle,rawDegrees:720,
       fineRange,readableTicks,preciseTarget,normalEndNotFault,realFaultVisible,
       replayFaultSuppressed,nearStaleSuppressed,liveFaultVisible};
   });
   assert(results.validOnly);
-  assert(results.holdSurvivesSettled);
+  assert(results.holdSurvivesSettled, 'hold on: a settled frame must not end the position lease');
+  assert(results.holdOffEndsSettled, 'hold off: a settled frame ends the position lease (release-and-coast)');
   assert(results.epochResets);
   assert(results.gainsReadBack, 'board readback must not silently clip PI gains');
   assert(results.knobReadback, 'knob UI must reflect board-side configuration');

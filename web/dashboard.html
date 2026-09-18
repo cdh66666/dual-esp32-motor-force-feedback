@@ -6,6 +6,55 @@
   <title>双电机力反馈 · 实时控制</title>
   <link rel="stylesheet" href="/dashboard.css?v=36gp-commissioned-20260905">
   <link rel="stylesheet" href="/dashboard-cascade.css?v=basic-calibration-20260914">
+  <style>
+    /* 实物相机 + 验收录制：一个可拖动、可缩放的浮窗，让实物画面与调试台曲线同屏。
+       用 CSS 变量跟随仪表盘配色，避免这个面板看起来像外挂进来的另一套 UI。 */
+    .cam-panel{position:fixed;right:16px;bottom:16px;z-index:60;width:392px;min-width:280px;
+      background:var(--panel);border:1px solid #31506a;border-radius:12px;overflow:hidden;
+      box-shadow:0 10px 30px #0009;resize:both;display:flex;flex-direction:column}
+    .cam-panel[hidden]{display:none}
+    .cam-panel>header{display:flex;align-items:center;gap:8px;padding:8px 10px;
+      background:#102231;border-bottom:1px solid var(--line);cursor:move;user-select:none}
+    .cam-panel>header strong{font-size:13px;white-space:nowrap}
+    .cam-panel>header select{flex:1;min-width:0;padding:4px 6px;font-size:12px;border-radius:7px}
+    .cam-panel>header button{padding:4px 9px;font-size:12px;border-radius:7px}
+    .cam-panel video{display:block;width:100%;aspect-ratio:16/9;background:#000;object-fit:contain}
+    .cam-panel video[hidden]{display:none}
+    /* 录制期间相机归录制进程独占，这里放的是它推过来的实时帧。默认只取合成图上
+       半的实物相机区域（object-fit:cover + object-position:top），需要时切到整张合成图。 */
+    .cam-panel .cam-view{position:relative;background:#000}
+    .cam-panel .cam-view img{display:block;width:100%;background:#000}
+    .cam-panel .cam-view.mode-cam img{aspect-ratio:16/9;object-fit:cover;object-position:top center}
+    .cam-panel .cam-view.mode-mix img{aspect-ratio:1280/1528;object-fit:contain}
+    .cam-panel .cam-view img[hidden]{display:none}
+    .cam-panel .rec-badge{position:absolute;left:8px;top:8px;display:flex;align-items:center;gap:6px;
+      background:#000c;border:1px solid var(--red);color:#ffd7d7;border-radius:999px;
+      padding:3px 10px;font-size:11px;letter-spacing:.4px}
+    .cam-panel .rec-badge[hidden]{display:none}
+    .cam-panel .rec-badge i{width:8px;height:8px;border-radius:50%;background:var(--red);
+      animation:recpulse 1.1s ease-in-out infinite}
+    @keyframes recpulse{0%,100%{opacity:1}50%{opacity:.25}}
+    .cam-panel .live-hint{position:absolute;left:8px;right:8px;bottom:8px;background:#000c;color:#ffd7d7;
+      border-radius:6px;padding:4px 8px;font-size:11px}
+    .cam-panel .live-hint[hidden]{display:none}
+    .cam-panel .cam-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px 0}
+    .cam-panel .cam-bar label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+    .cam-panel .cam-bar button{padding:7px 11px;font-size:13px}
+    .cam-panel .cam-bar select{padding:6px 8px;font-size:12px;border-radius:7px}
+    .cam-panel p{margin:8px 10px;color:var(--muted);font-size:12px}
+    .cam-panel #recState{min-height:2.4em}
+    .cam-panel #recState.rec{color:var(--amber);font-weight:700}
+    .cam-panel #recState.ok{color:var(--green)}
+    .cam-panel #recState.bad{color:var(--red)}
+    .cam-panel #recResult{border-top:1px solid var(--line);margin-top:8px;padding:8px 10px}
+    .cam-panel #recClip{width:100%;aspect-ratio:auto;border-radius:8px;margin-bottom:6px}
+    .cam-panel #recResult a{color:var(--blue);font-size:12px}
+    .cam-panel details{margin-top:6px}
+    .cam-panel summary{cursor:pointer;color:var(--blue);font-size:12px}
+    .cam-panel pre{margin:6px 0 0;max-height:150px;overflow:auto;font-size:11px;color:var(--muted);
+      white-space:pre-wrap}
+    .cam-show{position:fixed;right:16px;bottom:16px;z-index:60}
+  </style>
 </head>
 <body class="simple-mode">
   <header class="topbar">
@@ -79,6 +128,43 @@
   </details>
   <button id="advancedToggle" aria-expanded="false" class="advanced-toggle">展开高级诊断与手动参数</button>
   <main id="boards"></main>
+
+  <!-- 实物相机 + 验收录制。一个可拖动的小窗口，让同一屏里既有调试台曲线又有实物画面；
+       录制时由后台的录制进程抓两路并当场合成为一段视频。 -->
+  <section id="camPanel" class="cam-panel" aria-label="实物相机与验收录制">
+    <header id="camDrag">
+      <strong>实物相机 · 验收录制</strong>
+      <select id="camDevice" aria-label="选择相机"><option value="">正在枚举相机…</option></select>
+      <button id="camHide" type="button" title="收起这个窗口">收起</button>
+    </header>
+    <div class="cam-view mode-cam" id="camView">
+      <video id="camPreview" autoplay muted playsinline></video>
+      <img id="recLive" alt="录制进程的实时画面" hidden>
+      <span id="recBadge" class="rec-badge" hidden><i></i>录制中 · 实时画面来自录制进程</span>
+      <span id="liveHint" class="live-hint" hidden></span>
+    </div>
+    <div class="cam-bar">
+      <button id="recStart" class="primary" type="button">录制 15 秒</button>
+      <label>时长 <select id="recSeconds" aria-label="录制时长">
+        <option value="5">5 秒</option><option value="10">10 秒</option>
+        <option value="15" selected>15 秒</option><option value="30">30 秒</option>
+        <option value="60">60 秒</option></select></label>
+      <button id="recStop" class="danger" type="button" hidden>提前结束</button>
+      <button id="recView" type="button" hidden title="在实物画面与整张合成图之间切换">看合成图</button>
+    </div>
+    <p id="recState" role="status">相机未开启。点「开启相机」允许浏览器访问摄像头，之后就能在同一屏里对照实物与曲线。</p>
+    <div class="cam-bar">
+      <button id="camOn" type="button">开启相机</button>
+      <button id="camOff" type="button" hidden>关闭相机</button>
+    </div>
+    <div id="recResult" hidden>
+      <video id="recClip" controls preload="metadata"></video>
+      <p><span id="recInfo"></span> <a id="recLink" download>下载这一段</a></p>
+      <details><summary>这一段录到了哪些力反馈事件</summary><pre id="recEvents">—</pre></details>
+    </div>
+  </section>
+  <button id="camShow" class="cam-show" type="button" hidden>实物相机 / 录制</button>
+
   <div id="toast"></div>
   <div id="errorModal" class="modal" hidden role="alertdialog" aria-modal="true" aria-labelledby="errorTitle">
     <div class="modal-card">
@@ -104,6 +190,6 @@
     <label>目标 <input id="chainValue" type="number" step="0.01" value="0"></label><button id="chainApply">执行 1 秒</button>
     <p id="chainState" role="status">发现设备不会唤醒或转动电机。</p><button id="chainStop" class="danger">全链 STOP</button><button id="chainClose">关闭</button>
   </dialog>
-<script type="module" src="/dashboard.js?v=control-smooth-chain-20260916"></script>
+<script type="module" src="/dashboard.js?v=acceptance-live-20260918"></script>
 </body>
 </html>
